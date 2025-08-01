@@ -1,0 +1,4 @@
+datasets:
+  lmdb: "../encoder_lmdb"
+  metadata_parquet: "../metadata.parquet"
+  metadata_snow_cloud_parquet: "../metadata_snow_cloud.parquet"

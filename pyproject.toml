@@ -1,0 +1,19 @@
+[project]
+name = "bigearthnet-models"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "configilm>=0.7.1",
+    "fastparquet>=2024.11.0",
+    "ipykernel>=6.30.0",
+    "lightning>=2.5.2",
+    "lmdb>=1.7.3",
+    "numpy>=1.26.4",
+    "pandas>=2.3.1",
+    "pyarrow>=21.0.0",
+    "segmentation-models-pytorch>=0.5.0",
+    "timm>=1.0.19",
+    "torchgeo>=0.7.1",
+]

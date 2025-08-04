@@ -54,7 +54,7 @@ Change to the directory containing the AppImage
 cd same-directory-as-the-AppImage
 
 ## Make the AppImage executable
-chmod +x my.AppImage 
+chmod +x AppImage 
 
 ```
 

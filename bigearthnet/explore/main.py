@@ -4,12 +4,14 @@ import datetime
 from loguru import logger  
 import torch 
 import torch.nn as nn 
+import tqdm 
+import pandas as pd
 
 from src.utils.utils import load_config
 from src.data.loader import bigearthnet_loader, bigearthnet_DataModule
 from src.utils.torch import seed_everything
 from src.model_zoo.models import define_model_
-
+from src.metrics.metrics import MultiClasses
 
 ## Result dictionary 
 def create_result_dirs(base_dir="results"):
@@ -54,11 +56,12 @@ def build_model(config):
     model = define_model_(
         model_name = config['model']['model_name'],
         num_classes = config['model']['num_classes'],
-        input_channels=  config['model']['in_channels']
+        input_channels =  config['model']['in_channels'],
         weights = config['model']['weight'],
-        bands= config['model']['sentinel2_bands'],
+        bands = config['model']['sentinel2_bands'],
         selected_channels = config['model']['select_bands']
     )
+    
 
     ## gpu 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -68,18 +71,18 @@ def build_model(config):
 
 
 def build_opt(model, config):
-    optimizer_class = getattr(torch.optim, config['TRAINING']['optim'])
+    optimizer_class = getattr(torch.optim, config['training']['optim'])
 
     optimizer = optimizer_class(
         model.parameters(),
-        lr=float(config['TRAINING']['learning_rate']),
+        lr=float(config['training']['learning_rate']),
     )
-    scheduler = config['TRAINING']['scheduler']
+    scheduler = config['training']['scheduler']
     if scheduler:
-        logger.info(f"scheduler type: {config['TRAINING']['scheduler_type']}")
-        logger.info(f"scheduler factor: {config['TRAINING']['factor']}")
-        lr_scheduler = getattr(torch.optim.lr_scheduler, config['TRAINING']['scheduler_type'])
-        scheduler_class = lr_scheduler(optimizer, mode='min',factor=config['TRAINING']['factor'])
+        logger.info(f"scheduler type: {config['training']['scheduler_type']}")
+        logger.info(f"scheduler factor: {config['training']['factor']}")
+        lr_scheduler = getattr(torch.optim.lr_scheduler, config['training']['scheduler_type'])
+        scheduler_class = lr_scheduler(optimizer, mode='min',factor=config['training']['factor'])
     else:
         scheduler_class = None
 
@@ -203,15 +206,15 @@ def main()->None:
     config = load_config("src/config/config.yaml")
 
     #bands = config['DATASET']['bands']
-    num_epochs = config['TRAINING']['n_epoch']
+    num_epochs = config['training']['n_epoch']
 
     # Initialize best metrics at the beginning of training
-    if config['TRAINING']['save_strategy'] == "loss":
+    if config['training']['save_strategy'] == "loss":
         best_metric = float('inf')  # For loss, lower is better
         logger.info("Model will be saved based on validation loss")
     else:  # metric-based saving
-        metric_name = config['TRAINING']['save_metric']
-        save_mode = config['TRAINING']['save_mode']
+        metric_name = config['training']['save_metric']
+        save_mode = config['training']['save_mode']
         best_metric = float('inf') if save_mode == "min" else float('-inf')
         logger.info(f"Model will be saved based on average {metric_name} ({save_mode})")
 
@@ -223,7 +226,7 @@ def main()->None:
         path_dataset_lmdb=config_dataset["datasets"]["lmdb"],
         path_metadata_parquet=config_dataset["datasets"]["metadata_parquet"],
         path_metadata_snow_cloud_parquet=config_dataset["datasets"]["metadata_snow_cloud_parquet"],
-        batch_size=16
+        batch_size= config['training']['batch_size']
         )
 
     ## Train - Val and Test instances
@@ -242,9 +245,9 @@ def main()->None:
     optimizer, criterion, scheduler, scheduler_class = build_opt(model, config)
 
     ## Define Metrics Tracker 
-    train_metrics_tracker = 
-    val_metrics_tracker = 
-    test_metrics_tracker = 
+    train_metrics_tracker = MultiClasses(num_classes=config["model"]["num_classes"])
+   # val_metrics_tracker = 
+   # test_metrics_tracker = 
 
 if __name__ == "__main__":
     main()

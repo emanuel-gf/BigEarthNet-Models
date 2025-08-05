@@ -98,16 +98,15 @@ def train_epoch(model, train_loader, optimizer, criterion, device, metrics_track
 
     with tqdm(total=len(train_loader.dataset), ncols=100, colour='#3eedc4') as t:
         t.set_description("Training")
-        for x_data, y_data, valid_mask in train_loader:
+        for x_data, y_data in train_loader:
             x_data, y_data = x_data.to(device), y_data.to(device)
-            valid_mask = valid_mask.to(device)
             optimizer.zero_grad()
             outputs = model(x_data)
-            loss = criterion(outputs[valid_mask], y_data[valid_mask])
-            loss.backward()
+            loss = criterion(y_data) ## add loss 
+            loss.backward() #compute gradient
             optimizer.step()
 
-            metrics_tracker.update(outputs, y_data, valid_mask)
+            metrics_tracker.update(outputs, y_data)
             train_loss += loss.item()
             t.set_postfix(loss=loss.item())
             t.update(x_data.size(0))
@@ -123,12 +122,12 @@ def validate(model, val_loader, criterion, device, metrics_tracker):
     with torch.no_grad():
         with tqdm(total=len(val_loader.dataset), ncols=100, colour='#f4d160') as t:
             t.set_description("Validation")
-            for x_data, y_data, valid_mask in val_loader:
+            for x_data, y_data in val_loader:
                 x_data, y_data = x_data.to(device), y_data.to(device)
                 valid_mask = valid_mask.to(device)
                 outputs = model(x_data)
-                loss = criterion(outputs[valid_mask], y_data[valid_mask])
-                metrics_tracker.update(outputs, y_data, valid_mask)
+                loss = criterion(y_data)
+                metrics_tracker.update(outputs, y_data)
                 val_loss += loss.item()
                 t.set_postfix(loss=loss.item())
                 t.update(x_data.size(0))
@@ -144,12 +143,11 @@ def test_model(model, test_loader, criterion, device, metrics_tracker):
     with torch.no_grad():
         with tqdm(total=len(test_loader.dataset), ncols=100, colour='#cc99ff') as t:
             t.set_description("Testing")
-            for x_data, y_data, valid_mask in test_loader:
+            for x_data, y_data in test_loader:
                 x_data, y_data = x_data.to(device), y_data.to(device)
-                valid_mask = valid_mask.to(device)
                 outputs = model(x_data)
-                loss = criterion(outputs[valid_mask], y_data[valid_mask])
-                metrics_tracker.update(outputs, y_data, valid_mask)
+                loss = criterion(y_data)
+                metrics_tracker.update(outputs, y_data)
                 test_loss += loss.item()
                 t.set_postfix(loss=loss.item())
                 t.update(x_data.size(0))

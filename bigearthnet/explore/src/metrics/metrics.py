@@ -15,7 +15,6 @@ class MultiClasses(Metric):
         
         Args:
             num_classes (int): Number of classes (default: 20)
-            task (str): Task type - 'segmentation' or 'classification'
             average (str): Averaging method - 'macro', 'micro', 'weighted', or None
         """
         super().__init__()

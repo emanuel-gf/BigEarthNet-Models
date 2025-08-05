@@ -2,3 +2,49 @@ datasets:
   lmdb: "/root/storage_ds/encoder_lmdb"
   metadata_parquet: "/root/storage_ds/metadata.parquet"
   metadata_snow_cloud_parquet: "/root/storage_ds/metadata_snow_cloud.parquet"
+
+
+model: 
+  model_name: "resnet50"
+  encoder_name: "timm-efficientnet-b2"
+  encoder_weights: "imagenet"
+  weights: 'ResNet50_Weights.SENTINEL2_ALL_MOCO'
+  in_channels: 10
+  out_channels: 20
+  activation: softmax
+  num_classes: 20
+  select_bands: [1,2,3,4,5,6,7,8,11,12]
+  sentinel2_bands: {
+                      0:'B1',
+                      1:  'B2',
+                      2:  'B3',
+                      3:  'B4',
+                      4:  'B5',
+                      5:  'B6',
+                      6:  'B7',
+                      7:  'B8',
+                      8:  'B8a',
+                      9:  'B9',
+                      10:  'B10',
+                      11:  'B11',
+                      12:  'B12'
+                      }
+
+training:
+  seed: 42
+  learning_rate: 1e-3
+  scheduler: True
+  scheduler_type: ReduceLROnPlateau
+  factor: 0.5
+  optim: Adam
+  batch_size: 8
+  augmentation: False
+  n_epoch: 100
+  num_workers: 8
+  save_strategy: metric
+  save_metric: sam 
+  save_mode: max
+
+WANDB:
+  track: True
+  project_name: BigEarthNet-S2-DL-models

@@ -77,9 +77,10 @@ def bigearthnet_DataModule(
                         **kwargs
     ): 
     """
-        This function implements the DataModule from configILM.  The DataModule is a wrapper of LighthingPytorch and automatically generates 
-        per split with augmentations, shuffiling and other resources. All images are resized by default and normalized. The train set are additionally 
-        augmented via noise and flipping/rotation. The train split is shuffled.  
+        This function implements the DataModule from configILM.  
+        The DataModule is a wrapper of LighthingPytorch and automatically generates per split with augmentations,
+        shuffiling and other resources. All images are resized by default and normalized. 
+        The train set are additionally augmented via noise and flipping/rotation. The train split is shuffled.  
 
         It accepts any kwargs present at the BENv2_DataModule. e.g(shuffle, nurm_workers_dataloader,batch_size, img_sizew)
     """ 

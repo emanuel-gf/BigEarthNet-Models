@@ -1,8 +1,15 @@
 import yaml
 import os
+import datetime 
+from loguru import logger  
+import torch 
+import torch.nn as nn 
 
 from src.utils.utils import load_config
 from src.data.loader import bigearthnet_loader, bigearthnet_DataModule
+from src.utils.torch import seed_everything
+from src.model_zoo.models import define_model_
+
 
 ## Result dictionary 
 def create_result_dirs(base_dir="results"):
@@ -23,13 +30,14 @@ def create_result_dirs(base_dir="results"):
         "log_path": log_path
     }
 
-## 
+## Seed everything
 def setup_environment(config, log_path):
     os.makedirs(os.path.dirname(log_path), exist_ok=True)
     logger.add(log_path, rotation="10 MB")
     seed_everything(seed=config['TRAINING']['seed'])
 
 
+## Save logs 
 def save_config_to_log(config, log_dir, filename="config.yaml"):
     os.makedirs(log_dir, exist_ok=True)
     config_path = os.path.join(log_dir, filename)
@@ -38,42 +46,165 @@ def save_config_to_log(config, log_dir, filename="config.yaml"):
     logger.info(f"Saved config to {config_path}")
 
 
-def prepare_paths(path_dir):
-
-
-    df_input = pd.read_csv(f"{path_dir}/input.csv")
-    df_output = pd.read_csv(f"{path_dir}/target.csv")
-
-    df_input["path"] = df_input["Name"].apply(lambda x: os.path.join(path_dir, "input", os.path.basename(x).replace(".SAFE","")))
-    df_output["path"] = df_output["Name"].apply(lambda x: os.path.join(path_dir, "target", os.path.basename(x).replace(".SAFE","")))
-
-    return df_input, df_output
-
-
+## Build up model by definition 
+## It uses segmentation-models-torch to create the class that is by itself a nn.Torch
 def build_model(config):
 
 
-    model = define_model(
-        name=config['MODEL']['model_name'],
-        encoder_name=config['MODEL']['encoder_name'],
-        encoder_weights = config['MODEL']['encoder_weights'],
-        in_channel=len(config['DATASET']['bands']),
-        out_channels=len(config['DATASET']['bands']),
-        activation=config['MODEL']['activation'])
+    model = define_model_(
+        model_name = config['model']['model_name'],
+        num_classes = config['model']['num_classes'],
+        input_channels=  config['model']['in_channels']
+        weights = config['model']['weight'],
+        bands= config['model']['sentinel2_bands'],
+        selected_channels = config['model']['select_bands']
+    )
 
+    ## gpu 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = model.to(device)
+
     return model, device
 
 
-def main()->None:
+def build_opt(model, config):
+    optimizer_class = getattr(torch.optim, config['TRAINING']['optim'])
 
+    optimizer = optimizer_class(
+        model.parameters(),
+        lr=float(config['TRAINING']['learning_rate']),
+    )
+    scheduler = config['TRAINING']['scheduler']
+    if scheduler:
+        logger.info(f"scheduler type: {config['TRAINING']['scheduler_type']}")
+        logger.info(f"scheduler factor: {config['TRAINING']['factor']}")
+        lr_scheduler = getattr(torch.optim.lr_scheduler, config['TRAINING']['scheduler_type'])
+        scheduler_class = lr_scheduler(optimizer, mode='min',factor=config['TRAINING']['factor'])
+    else:
+        scheduler_class = None
+
+    ### Cross Entropy 
+    criterion = nn.CrossEntropyLoss()
+    return optimizer, criterion, scheduler, scheduler_class
+
+
+def train_epoch(model, train_loader, optimizer, criterion, device, metrics_tracker):
+    model.train()
+    metrics_tracker.reset()
+    train_loss = 0.0
+
+    with tqdm(total=len(train_loader.dataset), ncols=100, colour='#3eedc4') as t:
+        t.set_description("Training")
+        for x_data, y_data, valid_mask in train_loader:
+            x_data, y_data = x_data.to(device), y_data.to(device)
+            valid_mask = valid_mask.to(device)
+            optimizer.zero_grad()
+            outputs = model(x_data)
+            loss = criterion(outputs[valid_mask], y_data[valid_mask])
+            loss.backward()
+            optimizer.step()
+
+            metrics_tracker.update(outputs, y_data, valid_mask)
+            train_loss += loss.item()
+            t.set_postfix(loss=loss.item())
+            t.update(x_data.size(0))
+
+    return train_loss / len(train_loader), metrics_tracker.compute()
+
+
+def validate(model, val_loader, criterion, device, metrics_tracker):
+    model.eval()
+    metrics_tracker.reset()
+    val_loss = 0.0
+
+    with torch.no_grad():
+        with tqdm(total=len(val_loader.dataset), ncols=100, colour='#f4d160') as t:
+            t.set_description("Validation")
+            for x_data, y_data, valid_mask in val_loader:
+                x_data, y_data = x_data.to(device), y_data.to(device)
+                valid_mask = valid_mask.to(device)
+                outputs = model(x_data)
+                loss = criterion(outputs[valid_mask], y_data[valid_mask])
+                metrics_tracker.update(outputs, y_data, valid_mask)
+                val_loss += loss.item()
+                t.set_postfix(loss=loss.item())
+                t.update(x_data.size(0))
+
+    return val_loss / len(val_loader), metrics_tracker.compute()
+
+
+def test_model(model, test_loader, criterion, device, metrics_tracker):
+    model.eval()
+    metrics_tracker.reset()
+    test_loss = 0.0
+
+    with torch.no_grad():
+        with tqdm(total=len(test_loader.dataset), ncols=100, colour='#cc99ff') as t:
+            t.set_description("Testing")
+            for x_data, y_data, valid_mask in test_loader:
+                x_data, y_data = x_data.to(device), y_data.to(device)
+                valid_mask = valid_mask.to(device)
+                outputs = model(x_data)
+                loss = criterion(outputs[valid_mask], y_data[valid_mask])
+                metrics_tracker.update(outputs, y_data, valid_mask)
+                test_loss += loss.item()
+                t.set_postfix(loss=loss.item())
+                t.update(x_data.size(0))
+
+    return test_loss / len(test_loader), metrics_tracker.compute()
+
+
+def save_all_metrics(dict_metrics, test_metrics, bands, num_epochs, save_path, train_losses, val_losses):
+    os.makedirs(save_path, exist_ok=True)
+
+    for metric_type in ['psnr', 'rmse', 'ssim', 'sam']:
+        df_data = {'epoch': list(range(num_epochs))}
+        for phase in ['train', 'val']:
+            for band in bands:
+                key = f'{phase}_{metric_type}'
+                df_data[f'{phase}_{band}'] = dict_metrics[key][band]
+
+        df = pd.DataFrame(df_data)
+        file_path = os.path.join(save_path, f"{metric_type}_metrics.csv")
+        df.to_csv(file_path, index=False)
+        logger.info(f"Saved {metric_type} metrics to {file_path}")
+
+    test_summary = {
+        'band': bands,
+        'psnr': [test_metrics[b]['psnr'] for b in bands],
+        'rmse': [test_metrics[b]['rmse'] for b in bands],
+        'ssim': [test_metrics[b]['ssim'] for b in bands],
+        'sam': [test_metrics[b]['sam'] for b in bands]
+    }
+    df_test = pd.DataFrame(test_summary)
+    test_path = os.path.join(save_path, "test_metrics_summary.csv")
+    df_test.to_csv(test_path, index=False)
+    logger.info(f"Saved test metrics summary to {test_path}")
+
+    df_loss = pd.DataFrame({
+        'epoch': list(range(num_epochs)),
+        'train_loss': train_losses,
+        'val_loss': val_losses
+    })
+    loss_path = os.path.join(save_path, "losses.csv")
+    df_loss.to_csv(loss_path, index=False)
+    logger.info(f"Saved train/val losses to {loss_path}")
+
+
+def main()->None:
+    ## Create out dirs
     paths = create_result_dirs()
+
     log_path = paths['log_path']
     checkpoint_path = paths['checkpoint_path']
     metrics_path = paths['metrics_path']
-    bands = config['DATASET']['bands']
+
+    ## Load yaml file with configs
+    config = load_config("src/config/config.yaml")
+
+    #bands = config['DATASET']['bands']
     num_epochs = config['TRAINING']['n_epoch']
+
     # Initialize best metrics at the beginning of training
     if config['TRAINING']['save_strategy'] == "loss":
         best_metric = float('inf')  # For loss, lower is better
@@ -87,15 +218,7 @@ def main()->None:
 
     config_dataset = load_config( "src/config/config.yaml")
 
-    ## Load the Dataset 
-    ds = bigearthnet_loader(
-        path_dataset_lmdb=config_dataset["datasets"]["lmdb"],
-        path_metadata_parquet=config_dataset["datasets"]["metadata_parquet"],
-        path_metadata_snow_cloud_parquet=config_dataset["datasets"]["metadata_snow_cloud_parquet"],
-        train= True
-        )
-
-    ## Load the DataModule
+    ## Load the DataModule - Create DataAugmentation by Default
     dm = bigearthnet_DataModule(
         path_dataset_lmdb=config_dataset["datasets"]["lmdb"],
         path_metadata_parquet=config_dataset["datasets"]["metadata_parquet"],
@@ -103,8 +226,8 @@ def main()->None:
         batch_size=16
         )
 
-        
-    ## Create Train - Val and Test instances
+    ## Train - Val and Test instances
+    ## This instance populates the dm object. 
     dm.setup(stage="fit")
 
     ## Loaders
@@ -112,7 +235,16 @@ def main()->None:
     val_ds = dm.val_dataloader()
     test_ds = dm.test_dataloader()
 
+    ## Create the model 
+    model, device = build_model(config)
 
+    ## Define Optimizer, Scheduler and loss 
+    optimizer, criterion, scheduler, scheduler_class = build_opt(model, config)
+
+    ## Define Metrics Tracker 
+    train_metrics_tracker = 
+    val_metrics_tracker = 
+    test_metrics_tracker = 
 
 if __name__ == "__main__":
     main()

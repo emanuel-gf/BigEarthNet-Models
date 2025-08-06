@@ -94,7 +94,7 @@ def load_state_dict_with_flexibility(model: nn.Module, state_dict: dict, strict:
         if not matched:
             unmatched_keys.append(state_key)
     
-    logger.add('Adapating Tensor Input...')
+    logger.info('Adapating Tensor Input...')
     # Filter and adapt state dict
     adapted_state_dict = {}
     for state_key, model_key in key_mapping.items():
@@ -106,7 +106,7 @@ def load_state_dict_with_flexibility(model: nn.Module, state_dict: dict, strict:
             adapted_tensor = _adapt_tensor_size(state_tensor, model_tensor, state_key, bands, selected_channels)
             if adapted_tensor is not None:
                 adapted_state_dict[model_key] = adapted_tensor
-                logger.add(f" Adapted {state_key} -> {model_key}: {state_tensor.shape} -> {adapted_tensor.shape}")
+                logger.info(f" Adapted {state_key} -> {model_key}: {state_tensor.shape} -> {adapted_tensor.shape}")
             else:
                 print(f" Skipping {state_key} -> {model_key}: incompatible shapes {state_tensor.shape} vs {model_tensor.shape}")
         else:
@@ -192,10 +192,10 @@ def _adapt_tensor_size(state_tensor: torch.Tensor, target_tensor: torch.Tensor, 
                 }
                 channel_mapping = {i: common_bands.get(i, f"Band_{i}") for i in range(state_shape[1])}
             
-            logger.add(f"Available bands in source weights:")
+            logger.info(f"Available bands in source weights:",level='INFO')
             for i in range(state_shape[1]):
                 band_name = channel_mapping.get(i, f"Band_{i}")
-                logger.add(f"  Channel {i:2d}: {band_name}")
+                logger.info(f"  Channel {i:2d}: {band_name}",level='INFO')
             
             if target_shape[1] < state_shape[1]:
                 # Need to remove channels - use specific selection if provided
@@ -219,7 +219,7 @@ def _adapt_tensor_size(state_tensor: torch.Tensor, target_tensor: torch.Tensor, 
                     removed_channels = sorted(all_channels - set(selected_channels))
                     
                     print(f"REMOVING {len(removed_channels)} specific channels:")
-                    logger.add(f"REMOVING {len(removed_channels)} specific channels:")
+                    logger.info(f"REMOVING {len(removed_channels)} specific channels:")
 
                     for ch in removed_channels:
                         band_name = channel_mapping.get(ch, f"Band_{ch}")
@@ -298,7 +298,7 @@ def define_model_(
     """
     use_timm_pretrained_weights_imagenet = weights is True
     
-    logger.add(f'Creating Model: {model_name} with weights: {weights}')
+    logger.info(f'Creating Model: {model_name} with weights: {weights}')
 
     # Create model with TIMM
     model = timm.create_model(
@@ -309,19 +309,19 @@ def define_model_(
         **kwargs
     )
     
-    logger.add("Loading weights")
+    logger.info("Loading weights")
     # Load PyTorchGeo weights
     if weights and weights is not True:
         try:
             # Handle different weight types
             if isinstance(weights, WeightsEnum):
-                logger.add(f"Loading PyTorchGeo weights: {weights}")
+                logger.info(f"Loading PyTorchGeo weights: {weights}")
                 state_dict = weights.get_state_dict(progress=True)
 
             elif isinstance(weights, str):
                 if weights.endswith('.pth') or weights.endswith('.pt'):
                     # Load from file path
-                    logger.add(f"Loading weights from file: {weights}")
+                    logger.info(f"Loading weights from file: {weights}")
                     state_dict = torch.load(weights, map_location='cpu')
                     # Handle different state dict formats
                     if 'state_dict' in state_dict:
@@ -330,7 +330,7 @@ def define_model_(
                         state_dict = state_dict['model']
                 else:
                     # Load by PyTorchGeo weight name
-                    logger.add(f"Loading PyTorchGeo weights by name: {weights}")
+                    logger.info(f"Loading PyTorchGeo weights by name: {weights}")
                     weight_enum = get_weight(weights)
                     state_dict = weight_enum.get_state_dict(progress=True)
             else:
@@ -346,7 +346,7 @@ def define_model_(
     
     # Handle backbone freezing
     if freeze_backbone:
-        logger.add("Freezing backbone parameters...")
+        logger.info("Freezing backbone parameters...")
         # Freeze all parameters first
         for param in model.parameters():
             param.requires_grad = False

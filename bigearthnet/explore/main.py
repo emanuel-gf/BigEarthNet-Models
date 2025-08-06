@@ -1,17 +1,20 @@
 import yaml
 import os
-import datetime 
+from datetime import datetime
 from loguru import logger  
 import torch 
 import torch.nn as nn 
-import tqdm 
 import pandas as pd
+from torchvision import transforms
+from tqdm import tqdm
 
 from src.utils.utils import load_config
 from src.data.loader import bigearthnet_loader, bigearthnet_DataModule
 from src.utils.torch import seed_everything
 from src.model_zoo.models import define_model_
-from src.metrics.metrics import MultiClasses
+from src.metrics.metrics import MultiLabelMetrics
+from src.utils.wandb_logger import WandbLogger
+
 
 ## Result dictionary 
 def create_result_dirs(base_dir="results"):
@@ -36,7 +39,7 @@ def create_result_dirs(base_dir="results"):
 def setup_environment(config, log_path):
     os.makedirs(os.path.dirname(log_path), exist_ok=True)
     logger.add(log_path, rotation="10 MB")
-    seed_everything(seed=config['TRAINING']['seed'])
+    seed_everything(seed=config['training']['seed'])
 
 
 ## Save logs 
@@ -87,7 +90,7 @@ def build_opt(model, config):
         scheduler_class = None
 
     ### Cross Entropy 
-    criterion = nn.CrossEntropyLoss()
+    criterion = nn.BCEWithLogitsLoss()
     return optimizer, criterion, scheduler, scheduler_class
 
 
@@ -102,7 +105,7 @@ def train_epoch(model, train_loader, optimizer, criterion, device, metrics_track
             x_data, y_data = x_data.to(device), y_data.to(device)
             optimizer.zero_grad()
             outputs = model(x_data)
-            loss = criterion(y_data) ## add loss 
+            loss = criterion(outputs, y_data.float()) ## add loss 
             loss.backward() #compute gradient
             optimizer.step()
 
@@ -124,16 +127,65 @@ def validate(model, val_loader, criterion, device, metrics_tracker):
             t.set_description("Validation")
             for x_data, y_data in val_loader:
                 x_data, y_data = x_data.to(device), y_data.to(device)
-                valid_mask = valid_mask.to(device)
                 outputs = model(x_data)
-                loss = criterion(y_data)
+                loss = criterion(outputs, y_data)
                 metrics_tracker.update(outputs, y_data)
                 val_loss += loss.item()
                 t.set_postfix(loss=loss.item())
                 t.update(x_data.size(0))
+                metrics_tracker.update()
 
     return val_loss / len(val_loader), metrics_tracker.compute()
 
+def run_test(model, test_loader, criterion, device, metrics_tracker, checkpoint_path, wandb_logger=None):
+    """
+    Runs test evaluation on the best saved model.
+
+    Args:
+        model: your PyTorch model instance
+        test_loader: test DataLoader
+        criterion: loss function
+        device: torch.device
+        metrics_tracker: metric calculator instance
+        checkpoint_path: path to load best model weights from
+        wandb_logger: optional, for logging test results to wandb
+
+    Returns:
+        test_loss: average test loss
+        test_metrics: dict of test metrics (aggregated)
+    """
+    import torch
+
+    # Load best weights
+    best_model_path = os.path.join(checkpoint_path, "best_model.pth")
+    model.load_state_dict(torch.load(best_model_path))
+    model.to(device)
+    model.eval()
+
+    test_losses = []
+    metrics_tracker.reset()
+
+    with torch.no_grad():
+        for batch in test_loader:
+            inputs, targets = batch
+            inputs, targets = inputs.to(device), targets.to(device)
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
+            test_losses.append(loss.item())
+
+            metrics_tracker.update(outputs, targets)
+
+    test_loss = sum(test_losses) / len(test_losses)
+    test_metrics = metrics_tracker.compute()
+    metrics_tracker.reset()
+
+    if wandb_logger:
+        wandb_logger.log_test(test_loss, test_metrics)
+
+    logger.info(f"Test Loss: {test_loss:.6f}")
+    logger.info(f"Test Metrics: {test_metrics}")
+
+    return test_loss, test_metrics
 
 def test_model(model, test_loader, criterion, device, metrics_tracker):
     model.eval()
@@ -158,30 +210,36 @@ def test_model(model, test_loader, criterion, device, metrics_tracker):
 def save_all_metrics(dict_metrics, test_metrics, bands, num_epochs, save_path, train_losses, val_losses):
     os.makedirs(save_path, exist_ok=True)
 
-    for metric_type in ['psnr', 'rmse', 'ssim', 'sam']:
+    # Save train/val metrics per epoch
+    metrics_to_save = ['acc', 'f1', 'precision', 'recall']
+    phases = ['train', 'val']
+    
+    for metric in metrics_to_save:
         df_data = {'epoch': list(range(num_epochs))}
-        for phase in ['train', 'val']:
-            for band in bands:
-                key = f'{phase}_{metric_type}'
-                df_data[f'{phase}_{band}'] = dict_metrics[key][band]
-
+        for phase in phases:
+            key = f"{phase}_{metric}"
+            if key in dict_metrics:
+                df_data[key] = dict_metrics[key]
+            else:
+                logger.warning(f"Key {key} not found in dict_metrics.")
         df = pd.DataFrame(df_data)
-        file_path = os.path.join(save_path, f"{metric_type}_metrics.csv")
+        file_path = os.path.join(save_path, f"{metric}_metrics.csv")
         df.to_csv(file_path, index=False)
-        logger.info(f"Saved {metric_type} metrics to {file_path}")
+        logger.info(f"Saved {metric} metrics to {file_path}")
 
-    test_summary = {
-        'band': bands,
-        'psnr': [test_metrics[b]['psnr'] for b in bands],
-        'rmse': [test_metrics[b]['rmse'] for b in bands],
-        'ssim': [test_metrics[b]['ssim'] for b in bands],
-        'sam': [test_metrics[b]['sam'] for b in bands]
-    }
-    df_test = pd.DataFrame(test_summary)
-    test_path = os.path.join(save_path, "test_metrics_summary.csv")
-    df_test.to_csv(test_path, index=False)
-    logger.info(f"Saved test metrics summary to {test_path}")
+    # Save test metrics summary if available - Fix it, eliminate the bands
+    if test_metrics and bands:
+        test_summary = {
+            'band': bands,
+        }
+        for metric in metrics_to_save:
+            test_summary[metric] = [test_metrics[b].get(metric, None) for b in bands]
+        df_test = pd.DataFrame(test_summary)
+        test_path = os.path.join(save_path, "test_metrics_summary.csv")
+        df_test.to_csv(test_path, index=False)
+        logger.info(f"Saved test metrics summary to {test_path}")
 
+    # Save train/val losses
     df_loss = pd.DataFrame({
         'epoch': list(range(num_epochs)),
         'train_loss': train_losses,
@@ -191,11 +249,11 @@ def save_all_metrics(dict_metrics, test_metrics, bands, num_epochs, save_path, t
     df_loss.to_csv(loss_path, index=False)
     logger.info(f"Saved train/val losses to {loss_path}")
 
-
 def main()->None:
+
+    config_dataset = load_config( "src/config/config.yaml")
     ## Create out dirs
     paths = create_result_dirs()
-
     log_path = paths['log_path']
     checkpoint_path = paths['checkpoint_path']
     metrics_path = paths['metrics_path']
@@ -205,7 +263,8 @@ def main()->None:
 
     #bands = config['DATASET']['bands']
     num_epochs = config['training']['n_epoch']
-
+    selected_bands = config['model']['select_bands']
+    len_img_size_channel = len(selected_bands)
     # Initialize best metrics at the beginning of training
     if config['training']['save_strategy'] == "loss":
         best_metric = float('inf')  # For loss, lower is better
@@ -217,14 +276,27 @@ def main()->None:
         logger.info(f"Model will be saved based on average {metric_name} ({save_mode})")
 
 
-    config_dataset = load_config( "src/config/config.yaml")
+    ## SETUP env
+    setup_environment(config,log_path)
+    save_config_to_log(config, paths['result_dir'])
+    # set up weight and bias to track experiment
+    wandb_logger = WandbLogger(config=config, result_dir=paths)
 
     ## Load the DataModule - Create DataAugmentation by Default
     dm = bigearthnet_DataModule(
         path_dataset_lmdb=config_dataset["datasets"]["lmdb"],
         path_metadata_parquet=config_dataset["datasets"]["metadata_parquet"],
         path_metadata_snow_cloud_parquet=config_dataset["datasets"]["metadata_snow_cloud_parquet"],
-        batch_size= config['training']['batch_size']
+        batch_size= config['training']['batch_size'],
+        img_size = (len_img_size_channel,120,120), ## EarthNet is 120x120,
+        shuffle=False,
+        max_len= 80,  ## test if it is working
+        train_transforms = transforms.Compose([
+                                transforms.Resize((224, 224))  # Direct resize to expected size
+                                ]),
+        eval_transforms = transforms.Compose([
+                                    transforms.Resize((224, 224))  # Direct resize to expected size
+                                ])
         )
 
     ## Train - Val and Test instances
@@ -234,7 +306,6 @@ def main()->None:
     ## Loaders
     train_ds = dm.train_dataloader()
     val_ds = dm.val_dataloader()
-    test_ds = dm.test_dataloader()
 
     ## Create the model 
     model, device = build_model(config)
@@ -243,9 +314,104 @@ def main()->None:
     optimizer, criterion, scheduler, scheduler_class = build_opt(model, config)
 
     ## Define Metrics Tracker 
-    train_metrics_tracker = MultiClasses(num_classes=config["model"]["num_classes"])
-   # val_metrics_tracker = 
-   # test_metrics_tracker = 
+    train_metrics_tracker = MultiLabelMetrics(num_classes=config["model"]["num_classes"], threshold=0.6).to(device)
+    val_metrics_tracker = MultiLabelMetrics(num_classes=config["model"]["num_classes"], threshold=0.6).to(device)
+    test_metrics_tracker = MultiLabelMetrics(num_classes=config["model"]["num_classes"], threshold=0.6).to(device)
+
+    # test_metrics_tracker = MultiClasses(num_classes=config["model"]["num_classes"])
+
+    dict_metrics = {
+        'train_acc': [],
+        'train_f1': [],
+        'train_precision': [],
+        'train_recall': [],
+        'val_acc': [],
+        'val_f1': [],
+        'val_precision': [],
+        'val_recall': []
+    }
+
+    best_val_loss=float('inf')
+    save_model= False
+    train_losses = []
+    val_losses = []
+
+    for epoch in range(num_epochs):
+        train_loss, train_metrics = train_epoch(model, train_ds, optimizer, criterion, device, train_metrics_tracker)
+        val_loss, val_metrics = validate(model, val_ds, criterion, device, val_metrics_tracker)
+
+        ## pass the scheduler for each step
+        if scheduler:
+            scheduler_class.step(val_loss)
+        
+        # check and modified if necessary
+        current_lr = optimizer.param_groups[0]['lr']
+        logger.info(f"Current learning rate: {current_lr:.8f}")
+        logger.info(f"Epoch {epoch+1}: Train Loss= {train_loss:.6f}, Val Loss={val_loss:.6f}")
+
+        ## Add everything to the dict_metrics
+        dict_metrics['train_acc'].append(train_metrics['acc'])
+        dict_metrics['train_f1'].append(train_metrics['f1'])
+        dict_metrics['train_precision'].append(train_metrics['precision'])
+        dict_metrics['train_recall'].append(train_metrics['recall'])
+
+        dict_metrics['val_acc'].append(val_metrics['acc'])
+        dict_metrics['val_f1'].append(val_metrics['f1'])
+        dict_metrics['val_precision'].append(val_metrics['precision'])
+        dict_metrics['val_recall'].append(val_metrics['recall'])
+        wandb_logger.log_train(epoch, train_loss, val_loss, current_lr, train_metrics, val_metrics)
+
+        save_model = False
+
+        if config["training"]['save_strategy']=="loss":
+            if val_loss < best_metric:
+                best_metric = val_loss
+                save_model = True
+                save_message = f"Best model saved at epoch {epoch+1} with Val Loss: { best_metric:.6f}"
+        else: 
+            metric_name = config['training']['save_metric']
+            save_mode = config['training']['save_mode']
+            avg_metric = val_metrics.get(metric_name, 0.0) 
+
+            if (save_mode == "min" and avg_metric < best_metric) or \
+            (save_mode == "max" and avg_metric > best_metric):
+                best_metric = avg_metric
+                save_model = True
+                save_message = f"Best model saved at epoch {epoch+1} with avg {metric_name}: {best_metric:.6f}"
+        
+         # Save model if criteria met
+        if save_model:
+            model_path = os.path.join(checkpoint_path, "best_model.pth")
+            torch.save(model.state_dict(), model_path)
+            wandb_logger.save_model(model_path)
+            logger.info(save_message)
+
+        train_losses.append(train_loss)
+        val_losses.append(val_loss)
+
+    # save metrics
+    save_all_metrics(dict_metrics= dict_metrics, 
+                     test_metrics=None,
+                     bands=None,
+                     num_epochs=num_epochs,
+                     metrics_path=metrics_path,
+                     train_losses=train_losses,
+                     val_losses=val_losses
+                     )
+    
+
+    ## Populate the dataset with the test 
+    dm.setup('test')
+    test_ds = dm.test_dataloader()
+    if test_ds is not None:
+        model.load_state_dict(torch.load(os.path.join(checkpoint_path, 'best_model.pth')))
+        test_loss, test_metrics = test_model(model, test_ds, criterion, device, test_metrics_tracker)
+
+        wandb_logger.log_test(test_loss, test_metrics)
+
+    # # save all metrics
+        save_all_metrics(dict_metrics, test_metrics, selected_bands, num_epochs, metrics_path, train_losses, val_losses)
+
 
 if __name__ == "__main__":
     main()

@@ -8,11 +8,11 @@ model:
   model_name: "resnet50"
   encoder_name: "timm-efficientnet-b2"
   encoder_weights: "imagenet"
-  weights: 'ResNet50_Weights.SENTINEL2_ALL_MOCO'
+  weight: 'ResNet50_Weights.SENTINEL2_ALL_MOCO'
   in_channels: 10
-  out_channels: 20
+  out_channels: 19
   activation: softmax
-  num_classes: 20
+  num_classes: 19
   select_bands: [1,2,3,4,5,6,7,8,11,12]
   sentinel2_bands: {
                       0:'B1',
@@ -39,9 +39,9 @@ training:
   optim: Adam
   batch_size: 8
   augmentation: False
-  n_epoch: 100
+  n_epoch: 10
   num_workers: 8
-  save_strategy: metric
+  save_strategy: loss
   save_metric: sam 
   save_mode: max
 

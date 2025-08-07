@@ -251,6 +251,7 @@ class MultiLabelMetrics(Metric):
         self.precision.update(preds_processed, target_processed)
         self.recall.update(preds_processed, target_processed)
         self.f1_per_class.update(preds_processed, target_processed)
+        self.accuracy_per_class.update(preds_processed, target_processed)
         
         # Update custom states
         correct = torch.sum(preds_processed == target_processed)
@@ -314,6 +315,8 @@ class MultiLabelMetrics(Metric):
         self.f1_score.reset()
         self.precision.reset()
         self.recall.reset()
+        self.f1_per_class.reset()
+        self.accuracy_per_class.reset()
         self.f1_per_class.reset()
 
 

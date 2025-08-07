@@ -1,3 +1,5 @@
 ignore_file/ 
 __pychache__/
 *.pyc
+results/ 
+wandb/

@@ -133,7 +133,7 @@ def validate(model, val_loader, criterion, device, metrics_tracker):
                 val_loss += loss.item()
                 t.set_postfix(loss=loss.item())
                 t.update(x_data.size(0))
-                metrics_tracker.update()
+                #metrics_tracker.update()
 
     return val_loss / len(val_loader), metrics_tracker.compute()
 
@@ -198,7 +198,7 @@ def test_model(model, test_loader, criterion, device, metrics_tracker):
             for x_data, y_data in test_loader:
                 x_data, y_data = x_data.to(device), y_data.to(device)
                 outputs = model(x_data)
-                loss = criterion(y_data)
+                loss = criterion(outputs, y_data)
                 metrics_tracker.update(outputs, y_data)
                 test_loss += loss.item()
                 t.set_postfix(loss=loss.item())
@@ -211,7 +211,7 @@ def save_all_metrics(dict_metrics, test_metrics, bands, num_epochs, save_path, t
     os.makedirs(save_path, exist_ok=True)
 
     # Save train/val metrics per epoch
-    metrics_to_save = ['acc', 'f1', 'precision', 'recall']
+    metrics_to_save = ['accuracy', 'f1_score', 'precision', 'recall']
     phases = ['train', 'val']
     
     for metric in metrics_to_save:
@@ -228,12 +228,11 @@ def save_all_metrics(dict_metrics, test_metrics, bands, num_epochs, save_path, t
         logger.info(f"Saved {metric} metrics to {file_path}")
 
     # Save test metrics summary if available - Fix it, eliminate the bands
-    if test_metrics and bands:
+    if test_metrics:
         test_summary = {
-            'band': bands,
         }
         for metric in metrics_to_save:
-            test_summary[metric] = [test_metrics[b].get(metric, None) for b in bands]
+            test_summary[metric] = [test_metrics.get(metric, None)]
         df_test = pd.DataFrame(test_summary)
         test_path = os.path.join(save_path, "test_metrics_summary.csv")
         df_test.to_csv(test_path, index=False)
@@ -290,7 +289,7 @@ def main()->None:
         batch_size= config['training']['batch_size'],
         img_size = (len_img_size_channel,120,120), ## EarthNet is 120x120,
         shuffle=False,
-        max_len= 80,  ## test if it is working
+       # max_len= 80,  ## test if it is working
         train_transforms = transforms.Compose([
                                 transforms.Resize((224, 224))  # Direct resize to expected size
                                 ]),
@@ -306,6 +305,8 @@ def main()->None:
     ## Loaders
     train_ds = dm.train_dataloader()
     val_ds = dm.val_dataloader()
+    logger.info(f'Size of train_dataset: {len(train_ds)}')
+    logger.info(f"Size of Val dataset: {len(val_ds)}")
 
     ## Create the model 
     model, device = build_model(config)
@@ -321,14 +322,17 @@ def main()->None:
     # test_metrics_tracker = MultiClasses(num_classes=config["model"]["num_classes"])
 
     dict_metrics = {
-        'train_acc': [],
-        'train_f1': [],
+        'train_accuracy': [],
+        'train_f1_score': [],
         'train_precision': [],
         'train_recall': [],
-        'val_acc': [],
-        'val_f1': [],
+        'train_acc_per_class':[],
+        'val_accuracy': [],
+        'val_f1_score': [],
         'val_precision': [],
-        'val_recall': []
+        'val_recall': [],
+        'val_acc_per_class':[]
+
     }
 
     best_val_loss=float('inf')
@@ -350,15 +354,17 @@ def main()->None:
         logger.info(f"Epoch {epoch+1}: Train Loss= {train_loss:.6f}, Val Loss={val_loss:.6f}")
 
         ## Add everything to the dict_metrics
-        dict_metrics['train_acc'].append(train_metrics['acc'])
-        dict_metrics['train_f1'].append(train_metrics['f1'])
+        dict_metrics['train_accuracy'].append(train_metrics['accuracy'])
+        dict_metrics['train_f1_score'].append(train_metrics['f1_score'])
         dict_metrics['train_precision'].append(train_metrics['precision'])
         dict_metrics['train_recall'].append(train_metrics['recall'])
 
-        dict_metrics['val_acc'].append(val_metrics['acc'])
-        dict_metrics['val_f1'].append(val_metrics['f1'])
+        dict_metrics['val_accuracy'].append(val_metrics['accuracy'])
+        dict_metrics['val_f1_score'].append(val_metrics['f1_score'])
         dict_metrics['val_precision'].append(val_metrics['precision'])
         dict_metrics['val_recall'].append(val_metrics['recall'])
+        dict_metrics['train_acc_per_class'].append(train_metrics['accuracy_per_class'])
+        dict_metrics['val_acc_per_class'].append(val_metrics['accuracy_per_class'])
         wandb_logger.log_train(epoch, train_loss, val_loss, current_lr, train_metrics, val_metrics)
 
         save_model = False
@@ -388,21 +394,12 @@ def main()->None:
 
         train_losses.append(train_loss)
         val_losses.append(val_loss)
-
-    # save metrics
-    save_all_metrics(dict_metrics= dict_metrics, 
-                     test_metrics=None,
-                     bands=None,
-                     num_epochs=num_epochs,
-                     metrics_path=metrics_path,
-                     train_losses=train_losses,
-                     val_losses=val_losses
-                     )
     
 
     ## Populate the dataset with the test 
     dm.setup('test')
     test_ds = dm.test_dataloader()
+    logger.info(f"Size of Test Dataset: {test_ds}")
     if test_ds is not None:
         model.load_state_dict(torch.load(os.path.join(checkpoint_path, 'best_model.pth')))
         test_loss, test_metrics = test_model(model, test_ds, criterion, device, test_metrics_tracker)
@@ -411,6 +408,8 @@ def main()->None:
 
     # # save all metrics
         save_all_metrics(dict_metrics, test_metrics, selected_bands, num_epochs, metrics_path, train_losses, val_losses)
+    else:
+        print(f'Issues saving the metrics. Please retry')
 
 
 if __name__ == "__main__":

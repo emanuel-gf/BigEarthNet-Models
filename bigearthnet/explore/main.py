@@ -90,7 +90,7 @@ def build_opt(model, config):
         scheduler_class = None
 
     ### Cross Entropy 
-    criterion = nn.BCEWithLogitsLoss()
+    criterion = nn.CrossEntropyLoss()
     return optimizer, criterion, scheduler, scheduler_class
 
 
@@ -289,7 +289,7 @@ def main()->None:
         batch_size= config['training']['batch_size'],
         img_size = (len_img_size_channel,120,120), ## EarthNet is 120x120,
         shuffle=False,
-       # max_len= 80,  ## test if it is working
+        #max_len= 80,  ## test if it is working
         train_transforms = transforms.Compose([
                                 transforms.Resize((224, 224))  # Direct resize to expected size
                                 ]),

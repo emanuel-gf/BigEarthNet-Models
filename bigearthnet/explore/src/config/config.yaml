@@ -1,50 +1,60 @@
 datasets:
-  lmdb: "/root/storage_ds/encoder_lmdb"
+  root: "~/storage_ds/BigEarthNet-S2"
   metadata_parquet: "/root/storage_ds/metadata.parquet"
   metadata_snow_cloud_parquet: "/root/storage_ds/metadata_snow_cloud.parquet"
+  img_size: 120
+  upsampling_method: "bicubic"
+  resize: 224
 
 
 model: 
-  model_name: "resnet50"
-  encoder_name: "timm-efficientnet-b2"
-  encoder_weights: "imagenet"
-  weight: 'ResNet50_Weights.SENTINEL2_ALL_MOCO'
-  in_channels: 10
+  model_name: "resnet26"
+  ##encoder_name: "timm-efficientnet-b2"
+  ##encoder_weights: "imagenet"
+  ##weight: 'ResNet50_Weights.SENTINEL2_ALL_MOCO'
+  pretrained: True
+  in_channels: 3
   out_channels: 19
-  activation: relu  ### fix it 
+  activation: relu 
   num_classes: 19
-  select_bands: [1,2,3,4,5,6,7,8,11,12]
+  select_bands: [3,2,1] #RGB
   sentinel2_bands: {
-                      0:  'B1',
-                      1:  'B2',
-                      2:  'B3',
-                      3:  'B4',
-                      4:  'B5',
-                      5:  'B6',
-                      6:  'B7',
-                      7:  'B8',
-                      8:  'B8a',
-                      9:  'B9',
+                      0:  'B01',
+                      1:  'B02',
+                      2:  'B03',
+                      3:  'B04',
+                      4:  'B05',
+                      5:  'B06',
+                      6:  'B07',
+                      7:  'B08',
+                      8:  'B8A',
+                      9:  'B09',
                       10: 'B10',
                       11: 'B11',
                       12: 'B12'
                       }
 
 training:
+  positional_weight: True
+  sensitivity: 0.51
   seed: 42
   learning_rate: 1e-3
   scheduler: False
   scheduler_type: ReduceLROnPlateau  
   factor: 0.5
   optim: Adam
-  batch_size: 16
+  weight_decay: 1e-4
+  momentum: True
+  momentum_val: 0.9
+  batch_size: 32
   augmentation: False
-  n_epoch: 50
+  n_epoch: 80
   num_workers: 8
-  save_strategy: loss
+  save_strategy: f1_score
   save_metric: f1_score 
   save_mode: max
+  slice_of_training: Null 
 
 WANDB:
   track: True
-  project_name: TEST2-BigEarthNet-S2-DL-models
+  project_name: NOWPLEASE-BigEarthNet-S2-DL-models

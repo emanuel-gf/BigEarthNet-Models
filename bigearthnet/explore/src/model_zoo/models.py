@@ -391,3 +391,26 @@ def define_model_(
     return model
 
 
+
+
+def define_model_scratch(
+        model_name:str,
+        in_channel:int,
+        out_channel:int,
+        pretrained:bool
+
+):
+    
+    model = timm.create_model(
+            model_name,
+            num_classes=out_channel,
+            in_chans=in_channel,
+            pretrained=pretrained
+            )
+    
+    # model = nn.Sequential(
+    #     model,
+    #     nn.Sigmoid()
+    # )
+
+    return model

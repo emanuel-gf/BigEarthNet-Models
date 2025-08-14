@@ -402,7 +402,10 @@ class Dataset_BigEarthNet:
         transform=None,
         return_patch_id=False,
         patch_ids=None,
-        dict_one_hot={}
+        upper_limit_of_position_weights = 90,
+        down_limit_of_position_weights = 1,
+        dict_one_hot={},
+
     ):
         """
         Implements a Dataset submodule of pytorch. 
@@ -430,6 +433,9 @@ class Dataset_BigEarthNet:
                 Split the idx list into the choice, either: Train, Test or Val
             dict_one_hot: dict
                 Dict of labels for one-hot encoding
+            upper_limit_pos_weight : int
+                This is used inside the np.clip which imposes a higher limit to the weight tensor. It hinders  low frequency classes
+                from having a bias with inference. To higher limit creates a likely of that class being classified easily.
         """
         
         self.reader = reader
@@ -443,6 +449,8 @@ class Dataset_BigEarthNet:
         self.return_patch_id = return_patch_id
         self.dict_one_hot = dict_one_hot
         self.small_fraction = small_fraction
+        self.upper_limit_of_position_weights = upper_limit_of_position_weights
+        self.down_limit_of_position_weights = down_limit_of_position_weights
 
         # Initialize patch_ids_array based on split_train_test
         if self.split_train_test is not None:
@@ -495,6 +503,12 @@ class Dataset_BigEarthNet:
         return new_patch_ids_array
 
     def calculate_unbalanced_df(self):
+        """
+        Calculates the tensor of positional weight to be passed at the BCELogitLoss() function.
+        This tensor is given by the ratio of neg/pos classes. And deals with imbalanced classes.
+        The idea is that less frequent classes have a higher weight applied to the loss calculation.
+        However, the upper limit of the clip output should be carefully adapt it
+        """
         ## Get the filtered df by train/split and by the fraction applyied
         filtered_df = self.reader.metadata_parquet.loc[self.reader.metadata_parquet['patch_id'].isin(self.patch_ids_array)]
 
@@ -508,10 +522,13 @@ class Dataset_BigEarthNet:
         labels_df = pd.DataFrame(labels_matrix, columns=mlb.classes_)
 
         ## Sum classes
-        array_unbalanced = labels_df.sum(0).values
-        total_values = labels_df.sum(0).sum()
+        df_sum = pd.DataFrame()
+        df_sum['sum'] = labels_df.sum(0).values
+        df_sum['num_negatives'] = (labels_df.T.sum(1).sum()- labels_df.T.sum(1)).values
+        df_sum['neg/pos'] = df_sum['num_negatives']/df_sum['sum']
+
         ## Clip extremly low and extremely high values
-        array_out = np.clip((array_unbalanced/total_values),0.02,0.07)
+        array_out = np.clip((df_sum['neg/pos'].values),self.down_limit_of_position_weights,self.upper_limit_of_position_weights)
         logger.warning(f"Unbalanced results: {array_out}")
         return torch.tensor(array_out)
     

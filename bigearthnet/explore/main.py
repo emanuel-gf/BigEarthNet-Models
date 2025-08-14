@@ -18,6 +18,10 @@ from src.utils.wandb_logger import WandbLogger
 from src.loader.reader import Dataset_BigEarthNet, Reader
 from src.loader.reader import means_s2, stds_s2, get_list_means_std, get_right_dict, label_to_idx
 
+
+## Add code carbon
+from codecarbon import EmissionsTracker, track_emissions
+
 ## Result dictionary 
 def create_result_dirs(base_dir="results"):
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -127,7 +131,7 @@ def build_opt(model, config, pos_weight):
         optimizer = optimizer_class(
             model.parameters(),
             lr=float(config['training']['learning_rate']),
-            weight_decay=float(weight_decay)
+            #weight_decay=float(weight_decay)
         )
     elif config['training']['optim'] == 'SGD':
         logger.info(f"Adding Momentum to the given optimizer")
@@ -240,10 +244,11 @@ def train_epoch_debug(model, train_loader, optimizer, criterion, device, metrics
                 print(f"Label min/max: {y_data.min()}/{y_data.max()}")
                 print(f"Label unique values: {torch.unique(y_data)}")
                 print(f"Output min/max: {outputs.min()}/{outputs.max()}")
+                print(f"Output Sigmoid min/max: {output_metrics.min()}/{output_metrics.max()}")
                 #print(f"Metrics output - after sigmoid {output_metrics}")
                 print(f"OUTPUT {outputs[:5]}")
                 print(f"OUTPUT metrics {output_metrics[:5]}")
-                print(f"After senstivity: ", outputs_sens)
+                print(f"After senstivity: ", outputs_sens[:5])
                 print(f"Output shape: {outputs.shape}")
 
             metrics_tracker.update(outputs_sens, y_data.squeeze())
@@ -342,6 +347,9 @@ def save_all_metrics(dict_metrics, test_metrics, bands, num_epochs, save_path, t
     df_loss.to_csv(loss_path, index=False)
     logger.info(f"Saved train/val losses to {loss_path}")
 
+
+## track emission 
+@track_emissions(save_to_api=True,logging_logger=False)
 def main()->None:
 
     config_dataset = load_config( "src/config/config.yaml")
@@ -362,6 +370,7 @@ def main()->None:
     dict_sentinel2_bands =  config['model']['sentinel2_bands']
     name_selected_bands = [dict_sentinel2_bands[b] for b in selected_bands]
     small_fraction = config['training']['slice_of_training']
+    upper_limit = config['training']['upper_limit_pos_weight']
 
     logger.info(f"Number of selected bands: {len(selected_bands)}")
     logger.info(f"Selected Bands:{name_selected_bands}")
@@ -392,10 +401,12 @@ def main()->None:
                                          upsampling_method=config['datasets']['upsampling_method'])
     
     ## select only the mean and std for the given selected_bands 
-    list_mean, list_std = get_list_means_std(mean_dict=mean_dict,
-                                             std_dict=std_dict,
-                                            strip_bands=name_selected_bands
-                                            )
+    # list_mean, list_std = get_list_means_std(mean_dict=mean_dict,
+    #                                          std_dict=std_dict,
+    #                                         strip_bands=name_selected_bands
+    #                                         )
+    list_mean =[0.485, 0.456, 0.406]  # RGB order
+    list_std=[0.229, 0.224, 0.225]   # RGB order
     logger.info(f"List of average and stardard desviation ready: Mean= {list_mean} | Std {list_std} for bands |{selected_bands}")
 
     ## Create dataset instance
@@ -449,12 +460,9 @@ def main()->None:
     optimizer, criterion, scheduler, scheduler_class = build_opt(model, config, pos_weight)
 
     ## Define Metrics Tracker 
-    train_metrics_tracker = MultiLabelMetrics(num_classes=config["model"]["num_classes"],
-                                               threshold=config["training"]["sensitivity"]).to(device)
-    val_metrics_tracker = MultiLabelMetrics(num_classes=config["model"]["num_classes"], 
-                                            threshold=config["training"]["sensitivity"]).to(device)
-    test_metrics_tracker = MultiLabelMetrics(num_classes=config["model"]["num_classes"],
-                                              threshold=config["training"]["sensitivity"]).to(device)
+    train_metrics_tracker = MultiLabelMetrics(num_classes=config["model"]["num_classes"]).to(device)
+    val_metrics_tracker = MultiLabelMetrics(num_classes=config["model"]["num_classes"]).to(device)
+    test_metrics_tracker = MultiLabelMetrics(num_classes=config["model"]["num_classes"]).to(device)
 
     # test_metrics_tracker = MultiClasses(num_classes=config["model"]["num_classes"])
 
@@ -478,7 +486,7 @@ def main()->None:
     val_losses = []
 
     for epoch in range(num_epochs):
-        train_loss, train_metrics = train_epoch(model, train_dl, optimizer, criterion, device, train_metrics_tracker, sensitivity)
+        train_loss, train_metrics = train_epoch_debug(model, train_dl, optimizer, criterion, device, train_metrics_tracker, sensitivity)
         val_loss, val_metrics = validate(model, val_dl, criterion, device, val_metrics_tracker, sensitivity)
 
         ## pass the scheduler for each step
@@ -500,8 +508,6 @@ def main()->None:
         dict_metrics['val_f1_score'].append(val_metrics['f1_score'])
         dict_metrics['val_precision'].append(val_metrics['precision'])
         dict_metrics['val_recall'].append(val_metrics['recall'])
-        dict_metrics['train_acc_per_class'].append(train_metrics['accuracy_per_class'])
-        dict_metrics['val_acc_per_class'].append(val_metrics['accuracy_per_class'])
         wandb_logger.log_train(epoch, train_loss, val_loss, current_lr, train_metrics, val_metrics)
 
         save_model = False
@@ -526,7 +532,7 @@ def main()->None:
         if save_model:
             model_path = os.path.join(checkpoint_path, "best_model.pth")
             torch.save(model.state_dict(), model_path)
-            wandb_logger.save_model(model_path)
+            #wandb_logger.save_model(model_path)
             logger.info(save_message)
 
         train_losses.append(train_loss)

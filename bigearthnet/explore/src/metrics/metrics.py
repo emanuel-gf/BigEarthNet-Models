@@ -21,10 +21,10 @@ class MultiLabelMetrics(Metric):
         """
         super().__init__()
         self.num_classes = num_classes
-        self.threshold = threshold  # Keep for compatibility but don't use
+        #self.threshold = threshold 
         self.average = average
         
-        # Initialize torchmetrics for multilabel task
+        # multilabel 
         metric_task = "multilabel"
         
         # Core metrics
@@ -58,11 +58,7 @@ class MultiLabelMetrics(Metric):
             num_labels=num_classes,
             average=None
         )
-        self.accuracy_per_class = Accuracy(
-            task=metric_task,
-            num_labels=num_classes,
-            average=None
-        )
+
         
         # Custom state tracking
         self.add_state("correct", default=torch.tensor(0), dist_reduce_fx="sum")
@@ -101,7 +97,6 @@ class MultiLabelMetrics(Metric):
         self.precision.update(preds, target)
         self.recall.update(preds, target)
         self.f1_per_class.update(preds, target)
-        self.accuracy_per_class.update(preds, target)
         
         # Update custom states
         correct = torch.sum(preds == target)
@@ -126,7 +121,6 @@ class MultiLabelMetrics(Metric):
                 'recall': self.recall.compute(),
                 
                 # Per-class metrics
-                'accuracy_per_class': self.accuracy_per_class.compute(),
                 'f1_per_class': self.f1_per_class.compute(),
                 
                 # Custom metrics
@@ -145,7 +139,6 @@ class MultiLabelMetrics(Metric):
                 'f1_score': torch.tensor(0.0),
                 'precision': torch.tensor(0.0),
                 'recall': torch.tensor(0.0),
-                'accuracy_per_class': torch.zeros(self.num_classes),
                 'f1_per_class': torch.zeros(self.num_classes),
                 'element_accuracy': torch.tensor(0.0),
                 'correct_predictions': torch.tensor(0),
@@ -160,7 +153,6 @@ class MultiLabelMetrics(Metric):
         self.precision.reset()
         self.recall.reset()
         self.f1_per_class.reset()
-        self.accuracy_per_class.reset()
 def avg_metric_bands(val_metrics, metric_name):
     """
     Compute the average of a given metric_name across all bands.

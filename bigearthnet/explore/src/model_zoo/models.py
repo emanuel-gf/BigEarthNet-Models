@@ -405,7 +405,8 @@ def define_model_scratch(
             model_name,
             num_classes=out_channel,
             in_chans=in_channel,
-            pretrained=pretrained
+            pretrained=pretrained,
+            global_pool = 'avg'
             )
     
     # model = nn.Sequential(

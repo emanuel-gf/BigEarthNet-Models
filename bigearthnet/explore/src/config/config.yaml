@@ -8,7 +8,7 @@ datasets:
 
 
 model: 
-  model_name: "resnet26"
+  model_name: "resnet50"
   ##encoder_name: "timm-efficientnet-b2"
   ##encoder_weights: "imagenet"
   ##weight: 'ResNet50_Weights.SENTINEL2_ALL_MOCO'
@@ -36,7 +36,8 @@ model:
 
 training:
   positional_weight: True
-  sensitivity: 0.51
+  upper_limit_pos_weight : 30
+  sensitivity: 0.81
   seed: 42
   learning_rate: 1e-3
   scheduler: False
@@ -46,15 +47,15 @@ training:
   weight_decay: 1e-4
   momentum: True
   momentum_val: 0.9
-  batch_size: 32
+  batch_size: 16
   augmentation: False
   n_epoch: 80
   num_workers: 8
   save_strategy: f1_score
   save_metric: f1_score 
   save_mode: max
-  slice_of_training: Null 
+  slice_of_training: 0.25
 
 WANDB:
   track: True
-  project_name: NOWPLEASE-BigEarthNet-S2-DL-models
+  project_name: YES-BigEarthNet-S2-DL-models

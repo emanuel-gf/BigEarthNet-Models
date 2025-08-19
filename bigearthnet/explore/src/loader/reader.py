@@ -21,30 +21,9 @@ from functools import partial
 from sklearn.preprocessing import MultiLabelBinarizer
 import torch
 import torch.nn.functional as F
-
+from sklearn.preprocessing import minmax_scale
 
 ## Global  variables
-label_to_idx = {
-    'Arable land': 0,
-    'Broad-leaved forest': 1,
-    'Mixed forest': 2,
-    'Pastures': 3,
-    'Inland waters': 4,
-    'Coniferous forest': 5,
-    'Complex cultivation patterns': 6,
-    'Land principally occupied by agriculture, with significant areas of natural vegetation': 7,
-    'Urban fabric': 8,
-    'Industrial or commercial units': 9,
-    'Inland wetlands': 10,
-    'Transitional woodland, shrub': 11,
-    'Natural grassland and sparsely vegetated areas': 12,
-    'Moors, heathland and sclerophyllous vegetation': 13,
-    'Marine waters': 14,
-    'Coastal wetlands': 15,
-    'Permanent crops': 16,
-    'Beaches, dunes, sands': 17,
-    'Agro-forestry areas': 18
-}
 means_s2 = {
     "120_nearest": {
         "B01": 361.0767822265625,
@@ -147,25 +126,7 @@ stds_s2 = {
 }
 _s2_bandnames_10m_20m = ["B02", "B03", "B04", "B05", "B06", "B07", "B08", "B8A", "B11", "B12"]
 _s2_bandnames = ["B01", "B02", "B03", "B04", "B05", "B06", "B07", "B08", "B8A", "B09", "B11", "B12"]
-label_to_idx = {'Agro-forestry areas': 0,
-                'Arable land': 1,
-                'Beaches, dunes, sands': 2,
-                'Broad-leaved forest': 3,
-                'Coastal wetlands': 4,
-                'Complex cultivation patterns': 5,
-                'Coniferous forest': 6,
-                'Industrial or commercial units': 7,
-                'Inland waters': 8,
-                'Inland wetlands': 9,
-                'Land principally occupied by agriculture, with significant areas of natural vegetation': 10,
-                'Marine waters': 11,
-                'Mixed forest': 12,
-                'Moors, heathland and sclerophyllous vegetation': 13,
-                'Natural grassland and sparsely vegetated areas': 14,
-                'Pastures': 15,
-                'Permanent crops': 16,
-                'Transitional woodland, shrub': 17,
-                'Urban fabric': 18}
+
 
 
 def get_right_dict(s2_dict_mean,s2_dict_std, upsampling_method='nearest'):       
@@ -208,6 +169,8 @@ class Reader:
         logger.info('Initializing the Reader, structuring the paths and files.')
         self.root_folder_path = Path(root_folder_path).expanduser().resolve()
         self.metadata_parquet = pd.read_parquet(metadata_parquet_path)
+
+
         
         # Validate the root folder exists and is a directory
         if not self.root_folder_path.exists():
@@ -386,9 +349,6 @@ class Reader:
     
 
 
-
-
-
 class Dataset_BigEarthNet:
     def __init__(
         self,
@@ -402,8 +362,6 @@ class Dataset_BigEarthNet:
         transform=None,
         return_patch_id=False,
         patch_ids=None,
-        upper_limit_of_position_weights = 90,
-        down_limit_of_position_weights = 1,
         dict_one_hot={},
 
     ):
@@ -433,9 +391,7 @@ class Dataset_BigEarthNet:
                 Split the idx list into the choice, either: Train, Test or Val
             dict_one_hot: dict
                 Dict of labels for one-hot encoding
-            upper_limit_pos_weight : int
-                This is used inside the np.clip which imposes a higher limit to the weight tensor. It hinders  low frequency classes
-                from having a bias with inference. To higher limit creates a likely of that class being classified easily.
+            
         """
         
         self.reader = reader
@@ -447,10 +403,14 @@ class Dataset_BigEarthNet:
         self.split_train_test = split_train_test
         self.transform = transform
         self.return_patch_id = return_patch_id
-        self.dict_one_hot = dict_one_hot
         self.small_fraction = small_fraction
-        self.upper_limit_of_position_weights = upper_limit_of_position_weights
-        self.down_limit_of_position_weights = down_limit_of_position_weights
+
+        ## This store the MultiLabelBinarizer, which is the class to transform in one-hot-encoding
+        self.mlb_labels_  = None
+        self.mlb = MultiLabelBinarizer().fit(self.reader.metadata_parquet['labels'].values)
+
+        self.dict_one_hot = {v:i for i,v in enumerate(self.mlb.classes_)}
+        self.inverse_dict_one_hot = {i:v for i,v in enumerate(self.mlb.classes_)}
 
         # Initialize patch_ids_array based on split_train_test
         if self.split_train_test is not None:
@@ -460,21 +420,17 @@ class Dataset_BigEarthNet:
         else:
             # Use all patch_ids from metadata_parquet
             self.patch_ids_array = self.reader.metadata_parquet['patch_id'].values
-            logger.info(f"{self.split_train_test} split, with length of {len(self.patch_ids_array)}")
+            logger.info(f"Full dataset, with length of {len(self.patch_ids_array)}")
 
         if self.small_fraction is not None:
             self.patch_ids_array = self.__fraction_dataset__()
             logger.warning(f"Small sample selected. Dataset is reduced!")
             logger.info(f"{self.split_train_test} split, with length of {len(self.patch_ids_array)}")
-        # Set the multi-label one-hot encoder 
-        if self.dict_one_hot:
-            self.mlb = MultiLabelBinarizer().fit([list(self.dict_one_hot.keys())])
         else:
-            # If no dict_one_hot provided, we'll need to handle this case
-            self.mlb = None
-            logger.warning("No dict_one_hot provided. Labels will not be one-hot encoded.")
+            logger.warning("Using full dataset!!")
 
         logger.info(f"Bands orded by: {strip_bands}")
+
     def __len__(self) -> int:
         return len(self.patch_ids_array)
     
@@ -482,15 +438,14 @@ class Dataset_BigEarthNet:
         return self.patch_ids_array[index]
     
     def __series_patch_id__(self) -> pd.Series:
-        # Fixed method name (was missing underscore)
         return pd.Series(self.patch_ids_array)
     
     def __get_patch_id_array__(self):
-        """Filter the metadata to get patch IDs for the specified split"""
+        """Filter the metadata to get patch IDs for the specified split (train,test,validation)"""
         if hasattr(self.reader, 'metadata_parquet') and 'split' in self.reader.metadata_parquet.columns:
             array = self.reader.metadata_parquet.loc[
-                self.reader.metadata_parquet['split'] == self.split_train_test
-            ]['patch_id'].values
+                                                    self.reader.metadata_parquet['split'] == self.split_train_test
+                                                    ]['patch_id'].values
             return array
         else:
             logger.error("Reader metadata doesn't contain 'split' column or metadata is missing")
@@ -512,25 +467,44 @@ class Dataset_BigEarthNet:
         ## Get the filtered df by train/split and by the fraction applyied
         filtered_df = self.reader.metadata_parquet.loc[self.reader.metadata_parquet['patch_id'].isin(self.patch_ids_array)]
 
-        ## Calculate dummies 
-        from sklearn.preprocessing import MultiLabelBinarizer
-
-        mlb = MultiLabelBinarizer()
-        labels_matrix = mlb.fit_transform(filtered_df['labels'])
-
+        labels_matrix = self.mlb.transform(filtered_df['labels'])
+        
         ## Convert to df
-        labels_df = pd.DataFrame(labels_matrix, columns=mlb.classes_)
+        labels_df = pd.DataFrame(labels_matrix, columns=self.mlb.classes_)
 
         ## Sum classes
         df_sum = pd.DataFrame()
         df_sum['sum'] = labels_df.sum(0).values
+        ##df_sum.sort_values(by='labels',inplace=True)  ##MAKE IT SURE IS IN ORDER.
         df_sum['num_negatives'] = (labels_df.T.sum(1).sum()- labels_df.T.sum(1)).values
         df_sum['neg/pos'] = df_sum['num_negatives']/df_sum['sum']
 
-        ## Clip extremly low and extremely high values
-        array_out = np.clip((df_sum['neg/pos'].values),self.down_limit_of_position_weights,self.upper_limit_of_position_weights)
+        ## apply square root of log to use as the weights
+        #df_sum["logs"] = np.sqrt(np.log(df_sum["neg/pos"].values + 1)) 
+        df_sum["logs"] = np.log(df_sum["neg/pos"].values + 1) 
+        logger.info(f"Value of imbalanced before clip: {df_sum['logs'].values}")
+        ## scale over 1-10 
+        array_out = minmax_scale(df_sum["logs"].values, feature_range=(1,8)).astype(int)
+
+        print('---'*15)
+        if self.inverse_dict_one_hot is not None:
+            for i,v in enumerate(array_out):
+                print(self.inverse_dict_one_hot[i],':',v)
+
         logger.warning(f"Unbalanced results: {array_out}")
         return torch.tensor(array_out)
+    
+    def return_mlb_classes(self):
+        """ Return a MultiLabelBinarizer Class
+        """
+        arr = self.mlb.classes_
+        return arr
+    
+    def return_mlb(self):
+        return self.mlb
+    
+    def __length__(self):
+        return len(self.patch_ids_array)
     
     def stack_and_interpolate(
         self,
@@ -554,6 +528,7 @@ class Dataset_BigEarthNet:
         # Use instance variables as defaults
         if order is None:
             order = self.strip_bands
+            ##logger.info(f"Using order of bands: {order}")
         if img_size is None:
             img_size = self.img_size
         if upsample_mode is None:
@@ -621,126 +596,3 @@ class Dataset_BigEarthNet:
         except Exception as e:
             logger.error(f"Error loading patch {patch_id}: {str(e)}")
             raise
-
-# class Dataset_BigEarthNet:
-#     def __init__(
-#         self,
-#         reader,   # class
-#         strip_bands,
-#         img_size,
-#         upsample_mode,
-#         normalize,
-#         split_train_test,
-#         transform=None,
-#         return_patch_id=False,
-#         patch_ids = None,
-#         band_order = ["B01", "B02", "B03", "B04", "B05", "B06", "B07", "B08", "B8A", "B09", "B11", "B12"],
-#         dict_one_hot = {}
-#     ):
-#         """
-#         Implements a Dataset submodule of pytorch. 
-
-#         Args:
-#         reader: Reader CLASS
-#             See Reader class
-#         patch_ids: 
-#             The patch_ids. The way of selecting Train, Test and Val patches. 
-#         strip_bands: List. 
-#             Bands to be selected
-#         img_size: int.
-#             Size of the Image. It will apply a interpolation to the desired image size.
-#         upsample_mode: str Nearest, Bicubic, Biliear
-#             Method of interpolation
-#         band_order: List 
-#             Order of the bands presented at the BigEarthDataset. 
-#         normalize: bool
-#             If normalize the data or not.
-#         mean_dict: dict
-#             Dict with bands and mean values of each band
-#         std_dict: dict
-#             Dict with bands and std values of each band
-#         transform:
-#             If apply torch.transform on images
-#         return_patch_id: bool
-#             To return the patch Index of not
-#         split_train_test: str
-#             Split the idx list into the choice, either: Train, Test or Val
-#         """
-        
-#         self.reader = reader
-#         self.patch_ids = patch_ids
-#         self.strip_bands = strip_bands
-#         self.img_size = img_size
-#         self.upsample_mode = upsample_mode
-#         self.normalize = normalize
-#         self.split_train_test = split_train_test
-#         self.transform = transform
-#         self.return_patch_id = return_patch_id
-#         self.dict_one_hot = dict_one_hot ## dict of labels 
-#         # Get band order
-#         if band_order is None:
-#             self.band_order = reader.__bandorder__()
-#         else:
-#             self.band_order = band_order
-
-#         if self.split_train_test is None:
-#                 # Filter the df to train\test\split
-#                 self.patch_ids_array = self.__get_patch_id_array__()
-#                 logger.info(f"{self.split_train_test} with length of {len(self.patch_ids_array)}")
-#         else:
-#             self.patch_ids_array = self.reader.metadata['patch_id'].values
-
-
-#         ## Set the multi-one hot encoder 
-#         self.mlb = MultiLabelBinarizer().fit([self.dict_one_hot.keys()])
-
-#     def __len__(self) -> int:
-#         return len(self.patch_ids)
-    
-#     def __patch_id__(self, index:int) -> str:
-#         return self.patch_ids.iloc[index]
-    
-#     def __series__patch_id__(self) -> pd.Series():
-#         return self.patch_ids
-    
-
-#     def __get_patch_id_array__(self):
-#         ## Filter the dict 
-#         array = self.reader.metadata.loc[self.reader.metadata['split']==self.split_train_test]['patch_id'].values
-#         return  array
-        
-
-#     def __getitem__(self, idx: int) -> Union[Tuple[torch.Tensor, Any], Tuple[torch.Tensor, Any, str]]:
-#         ## search for id on the Series
-#         patch_id = self.patch_ids_array[idx]
-
-#         try:
-#             # Get data from LMDB reader
-#             image_data, labels = self.reader.__getitem__(patch_id)
-
-#             ## Convert labels to one-hot encoder 
-#             labels_onehot = self.mlb.transform([labels])
-#             labels_onehot = torch.from_numpy(labels_onehot)
-
-#             # Stack and Interpolate
-#             ## Interpolate all bands to have the same size, taken from img_size.
-#             img_tensor = stack_and_interpolate(
-#                 bands=image_data,
-#                 order=self.strip_bands,
-#                 img_size=self.img_size,
-#                 upsample_mode=self.upsample_mode
-#             )
-
-#             # Apply transforms if provided
-#             if self.transform is not None:
-#                 img_tensor = self.transform(img_tensor)
-
-#             # Return data
-#             if self.return_patch_id:
-#                 return img_tensor, labels_onehot, patch_id
-#             else:
-#                 return img_tensor, labels_onehot
-                
-#         except Exception as e:
-#             logger.error(f"Error loading patch {patch_id}: {str(e)}")
-#             raise

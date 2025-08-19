@@ -2,13 +2,15 @@ import wandb
 from loguru import logger
 import torch 
 class WandbLogger:
-    def __init__(self, config, result_dir):
+    def __init__(self, config, result_dir, name_run):
         self.use_wandb = config['WANDB']['track']
         self.bands = config['model']['select_bands']
 
         if self.use_wandb:
             wandb.init(project=config['WANDB']['project_name'], config=config)
-            wandb.run.name = result_dir["timestamp"]
+            if name_run is None:
+                name_run = result_dir['timestamp']
+            wandb.run.name = name_run
             self.run = wandb.run
             logger.info(f"Initialized Weights & Biases run: {self.run.name}")
         else:

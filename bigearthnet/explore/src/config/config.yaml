@@ -1,6 +1,6 @@
 datasets:
   root: "~/storage_ds/BigEarthNet-S2"
-  metadata_parquet: "/root/storage_ds/metadata.parquet"
+  metadata_parquet: "/root/bigearthnet/BigEarthNet-Models/df_balanced/teste2.parquet"
   metadata_snow_cloud_parquet: "/root/storage_ds/metadata_snow_cloud.parquet"
   img_size: 120
   upsampling_method: "bicubic"
@@ -9,15 +9,9 @@ datasets:
 
 model: 
   model_name: "resnet50"
-  ##encoder_name: "timm-efficientnet-b2"
-  ##encoder_weights: "imagenet"
-  ##weight: 'ResNet50_Weights.SENTINEL2_ALL_MOCO'
   pretrained: True
-  in_channels: 3
-  out_channels: 19
-  activation: relu 
   num_classes: 19
-  select_bands: [3,2,1] #RGB
+  select_bands: [3,2,1]  ##[3,2,1] #RGB
   sentinel2_bands: {
                       0:  'B01',
                       1:  'B02',
@@ -35,27 +29,26 @@ model:
                       }
 
 training:
-  positional_weight: True
-  upper_limit_pos_weight : 30
-  sensitivity: 0.81
-  seed: 42
+  positional_weight: False
+  sensitivity: 0.69
+  seed: 41
   learning_rate: 1e-3
   scheduler: False
   scheduler_type: ReduceLROnPlateau  
   factor: 0.5
   optim: Adam
-  weight_decay: 1e-4
+  weight_decay: 1e-3
   momentum: True
   momentum_val: 0.9
-  batch_size: 16
+  batch_size: 32
   augmentation: False
   n_epoch: 80
   num_workers: 8
   save_strategy: f1_score
   save_metric: f1_score 
   save_mode: max
-  slice_of_training: 0.25
+  slice_of_training: 1.0
 
 WANDB:
   track: True
-  project_name: YES-BigEarthNet-S2-DL-models
+  project_name: NOWorNOW-BigEarthNet-S2-DL-models

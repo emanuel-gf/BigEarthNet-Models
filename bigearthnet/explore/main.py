@@ -3,12 +3,13 @@ import os
 from datetime import datetime
 from loguru import logger  
 import torch 
+import random
 import torch.nn as nn 
 import pandas as pd
 from torchvision import transforms
 from tqdm import tqdm
 from torch.utils.data import DataLoader
-
+import pandas as pd
 from src.utils.utils import load_config
 from src.data.loader import bigearthnet_loader, bigearthnet_DataModule
 from src.utils.torch import seed_everything
@@ -16,7 +17,7 @@ from src.model_zoo.models import define_model_, define_model_scratch
 from src.metrics.metrics import MultiLabelMetrics
 from src.utils.wandb_logger import WandbLogger
 from src.loader.reader import Dataset_BigEarthNet, Reader
-from src.loader.reader import means_s2, stds_s2, get_list_means_std, get_right_dict, label_to_idx
+from src.loader.reader import means_s2, stds_s2, get_list_means_std, get_right_dict
 
 
 ## Add code carbon
@@ -58,7 +59,7 @@ def save_config_to_log(config, log_dir, filename="config.yaml"):
 
 
 ## Build up model by definition 
-def reader_(config_dataset, name_selected_bands):
+def reader_(config_dataset):
     """ Create a class that handles the retrieval of tif files. 
     """
     reader = Reader(
@@ -67,8 +68,9 @@ def reader_(config_dataset, name_selected_bands):
     )
     return reader 
 
-def loader_dataset(train_test_split:str,reader, config, name_selected_bands, 
-                    list_mean, list_std, label_to_idx, small_fraction=None):
+def loader_dataset(train_test_split,reader, config, name_selected_bands, 
+                    list_mean, list_std, small_fraction=None,
+                    ):
     """
     Create a torch DataSet class that will iterate be passed on a datamodule
     """
@@ -79,12 +81,12 @@ def loader_dataset(train_test_split:str,reader, config, name_selected_bands,
         upsample_mode=config["datasets"]["upsampling_method"],
         normalize =True,
         split_train_test= train_test_split,
-        dict_one_hot= label_to_idx,
         small_fraction=small_fraction,
         transform= transforms.Compose([
             transforms.Normalize(mean=list_mean, std=list_std),
             transforms.Resize([224,224])
-        ])
+        ]),
+        return_patch_id=False
         )
 
 def loader_dataloader(dataset,**kwargs):
@@ -94,25 +96,15 @@ def loader_dataloader(dataset,**kwargs):
         )
 ## It uses segmentation-models-torch to create the class that is by itself a nn.Torch
 def build_model(config):
-
-
-    # model = define_model_(
-    #     model_name = config['model']['model_name'],
-    #     num_classes = config['model']['num_classes'],
-    #     input_channels =  config['model']['in_channels'],
-    #     weights = config['model']['weight'],
-    #     bands = config['model']['sentinel2_bands'],
-    #     selected_channels = config['model']['select_bands']
-    # )
     model = define_model_scratch(
         model_name = config['model']['model_name'],
         out_channel= config['model']['num_classes'],
-        in_channel= config['model']['in_channels'],
+        in_channel= len(config['model']['select_bands']),
         pretrained=config['model']['pretrained']
     )
     logger.info('Model created sucesfully')
-    if config['model']['pretrained']:
-        logger.info(model.pretrained_cfg)
+    if config['model']['pretrained']==True:
+        logger.success("Pretrained weights loaded successfully!!!")
 
     ## gpu 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -131,7 +123,7 @@ def build_opt(model, config, pos_weight):
         optimizer = optimizer_class(
             model.parameters(),
             lr=float(config['training']['learning_rate']),
-            #weight_decay=float(weight_decay)
+            weight_decay=float(weight_decay)
         )
     elif config['training']['optim'] == 'SGD':
         logger.info(f"Adding Momentum to the given optimizer")
@@ -155,7 +147,7 @@ def build_opt(model, config, pos_weight):
         
         # For ReduceLROnPlateau, add patience parameter
         if config['training']['scheduler_type'] == 'ReduceLROnPlateau':
-            patience = config['training'].get('patience', 10)  #patience of 10
+            patience = config['training'].get('patience', 5)  #patience of 10
             scheduler_class = lr_scheduler(
                 optimizer, 
                 mode='min', 
@@ -201,7 +193,7 @@ def train_epoch(model, train_loader, optimizer, criterion, device, metrics_track
 
     return train_loss / len(train_loader), metrics_tracker.compute()
 
-def train_epoch_debug(model, train_loader, optimizer, criterion, device, metrics_tracker, sensitivity):
+def train_epoch_debug(model, train_loader, optimizer, criterion, device, metrics_tracker, sensitivity,mlb):
     model.train()
     metrics_tracker.reset()
     train_loss = 0.0
@@ -223,6 +215,7 @@ def train_epoch_debug(model, train_loader, optimizer, criterion, device, metrics
             
 
             loss.backward()
+
             # Check gradient flow
             if batch_idx == 0:
                 total_norm = 0
@@ -238,17 +231,24 @@ def train_epoch_debug(model, train_loader, optimizer, criterion, device, metrics
             outputs_sens = (output_metrics>sensitivity).float()
             
                         # Debug prints for first batch
-            if batch_idx == 1:
+            if batch_idx == 0:
                 print(f"Input shape: {x_data.shape}")
                 print(f"Label shape: {y_data.shape}")
                 print(f"Label min/max: {y_data.min()}/{y_data.max()}")
                 print(f"Label unique values: {torch.unique(y_data)}")
                 print(f"Output min/max: {outputs.min()}/{outputs.max()}")
                 print(f"Output Sigmoid min/max: {output_metrics.min()}/{output_metrics.max()}")
-                #print(f"Metrics output - after sigmoid {output_metrics}")
-                print(f"OUTPUT {outputs[:5]}")
-                print(f"OUTPUT metrics {output_metrics[:5]}")
-                print(f"After senstivity: ", outputs_sens[:5])
+                ##print(f"OUTPUT {outputs[:2]}")
+                print(f"OUTPUT Sigmoid metrics {output_metrics[:2]}")
+                print(f"After senstivity: ", outputs_sens[:2])
+                tensor_to_numpy = outputs_sens.clone().detach().cpu().numpy()
+                n1 = tensor_to_numpy.astype(int)
+                print("class label")
+                for i in n1[:10]:
+                    print(f"{mlb.inverse_transform(i.reshape(1,-1))}") 
+                print("Ground truth")
+                for i in y_data.clone().detach().cpu().numpy().astype(int)[:10]:
+                    print(f"mlb gt: {mlb.inverse_transform(i.reshape(1,-1))}")
                 print(f"Output shape: {outputs.shape}")
 
             metrics_tracker.update(outputs_sens, y_data.squeeze())
@@ -256,9 +256,12 @@ def train_epoch_debug(model, train_loader, optimizer, criterion, device, metrics
             t.set_postfix(loss=loss.item())
             t.update(x_data.size(0))
 
+    
+
     return train_loss / len(train_loader), metrics_tracker.compute()
 
-def validate(model, val_loader, criterion, device, metrics_tracker, sensitivity):
+
+def validate(model, val_loader, criterion, device, metrics_tracker, sensitivity,mlb):
     model.eval()
     metrics_tracker.reset()
     val_loss = 0.0
@@ -266,13 +269,34 @@ def validate(model, val_loader, criterion, device, metrics_tracker, sensitivity)
     with torch.no_grad():
         with tqdm(total=len(val_loader.dataset), ncols=100, colour='#f4d160') as t:
             t.set_description("Validation")
-            for x_data, y_data in val_loader:
+            for batch_idx, (x_data, y_data) in enumerate(val_loader):
                 x_data, y_data = x_data.to(device), y_data.to(device)
                 outputs = model(x_data)
                 loss = criterion(outputs, y_data.squeeze().float())
 
                 output_metrics = torch.sigmoid(outputs)
                 outputs_sens = (output_metrics>sensitivity).float()
+
+                if batch_idx == 0:
+                    print("---"*30)
+                    print(f"Input shape: {x_data.shape}")
+                    print(f"Label shape: {y_data.shape}")
+                    print(f"Label min/max: {y_data.min()}/{y_data.max()}")
+                    print(f"Label unique values: {torch.unique(y_data)}")
+                    print(f"Output min/max: {outputs.min()}/{outputs.max()}")
+                    print(f"Output Sigmoid min/max: {output_metrics.min()}/{output_metrics.max()}")
+                    ##print(f"OUTPUT {outputs[:2]}")
+                    print(f"OUTPUT Sigmoid metrics {output_metrics[:2]}")
+                    print(f"After senstivity: ", outputs_sens[:2])
+                    tensor_to_numpy = outputs_sens.clone().detach().cpu().numpy()
+                    n1 = tensor_to_numpy.astype(int)
+                    print("class label")
+                    for i in n1[:10]:
+                        print(f"{mlb.inverse_transform(i.reshape(1,-1))}") 
+                    print("Ground truth")
+                    for i in y_data.clone().detach().cpu().numpy().astype(int)[:10]:
+                        print(f"mlb gt: {mlb.inverse_transform(i.reshape(1,-1))}")
+                    print(f"Output shape: {outputs.shape}")
 
                 metrics_tracker.update(outputs_sens, y_data.squeeze())
                 val_loss += loss.item()
@@ -349,10 +373,9 @@ def save_all_metrics(dict_metrics, test_metrics, bands, num_epochs, save_path, t
 
 
 ## track emission 
-@track_emissions(save_to_api=True,logging_logger=False)
+#@track_emissions(save_to_api=True,logging_logger=False, log_level='critical')
 def main()->None:
 
-    config_dataset = load_config( "src/config/config.yaml")
     ## Create out dirs
     paths = create_result_dirs()
     log_path = paths['log_path']
@@ -362,18 +385,24 @@ def main()->None:
     ## Load yaml file with configs
     config = load_config("src/config/config.yaml")
 
-    #bands = config['DATASET']['bands']
+    ## MLB 
+    df_parquet = pd.read_parquet(config['datasets']['metadata_parquet'])
+
     sensitivity = config['training']['sensitivity']
     logger.info(f"Sensitivity:{sensitivity}")
     num_epochs = config['training']['n_epoch']
     selected_bands = config['model']['select_bands']
     dict_sentinel2_bands =  config['model']['sentinel2_bands']
     name_selected_bands = [dict_sentinel2_bands[b] for b in selected_bands]
-    small_fraction = config['training']['slice_of_training']
-    upper_limit = config['training']['upper_limit_pos_weight']
 
     logger.info(f"Number of selected bands: {len(selected_bands)}")
     logger.info(f"Selected Bands:{name_selected_bands}")
+
+    small_fraction = config['training']['slice_of_training']
+    if int(small_fraction)==int(1.0):
+        small_fraction = None
+    else: 
+        logger.info(f"Fraction of training data: {small_fraction}")
 
     # Initialize best metrics at the beginning of training
     if config['training']['save_strategy'] == "loss":
@@ -387,13 +416,19 @@ def main()->None:
 
     ## SETUP env
     setup_environment(config,log_path)
+    if config['training']['positional_weight']==True:
+        ps_str = 'PS'
+    else:
+        ps_str = '-'
     save_config_to_log(config, paths['result_dir'])
+    name_run = f"{str(len(selected_bands))}B" +f"-{sensitivity}sens" + f"-{str(config['training']['learning_rate'])}LR"+ f"{str(config['training']['weight_decay'])}WD"+f"-{ps_str}"##+##f"{str(paths['result_dir']['timestamp'])}"
+    logger.warning(f"Run name: {name_run}")
     # set up weight and bias to track experiment
-    wandb_logger = WandbLogger(config=config, result_dir=paths)
+    wandb_logger = WandbLogger(config=config, result_dir=paths, name_run = name_run)
 
-    ## Create the LMDB reader
-    reader = reader_(config, name_selected_bands)
-    logger.info("Reader READY")
+    ## Create the Reader
+    reader = reader_(config)
+    logger.success("Reader READY")
 
     ## Select the dict containg the Std and Mean for each band
     mean_dict, std_dict = get_right_dict(s2_dict_mean=means_s2,
@@ -401,26 +436,29 @@ def main()->None:
                                          upsampling_method=config['datasets']['upsampling_method'])
     
     ## select only the mean and std for the given selected_bands 
-    # list_mean, list_std = get_list_means_std(mean_dict=mean_dict,
-    #                                          std_dict=std_dict,
-    #                                         strip_bands=name_selected_bands
-    #                                         )
-    list_mean =[0.485, 0.456, 0.406]  # RGB order
-    list_std=[0.229, 0.224, 0.225]   # RGB order
+    list_mean, list_std = get_list_means_std(mean_dict=mean_dict,
+                                             std_dict=std_dict,
+                                            strip_bands=name_selected_bands
+                                            )
+    # list_mean =[0.485, 0.456, 0.406]  # RGB order
+    # list_std=[0.229, 0.224, 0.225]   # RGB order
+    
     logger.info(f"List of average and stardard desviation ready: Mean= {list_mean} | Std {list_std} for bands |{selected_bands}")
 
     ## Create dataset instance
     dataset_train = loader_dataset('train',reader=reader, config=config,
                                             name_selected_bands=name_selected_bands, list_mean=list_mean,
-                                            list_std=list_std, label_to_idx=label_to_idx, small_fraction=small_fraction)
+                                            list_std=list_std, small_fraction=small_fraction
+
+                                            )
 
     dataset_val = loader_dataset('validation',reader=reader, config=config,
                                             name_selected_bands=name_selected_bands, list_mean=list_mean,
-                                            list_std=list_std, label_to_idx=label_to_idx, small_fraction=small_fraction)
+                                            list_std=list_std, small_fraction=small_fraction)
 
     dataset_test = loader_dataset('test',reader=reader, config=config,
                                             name_selected_bands=name_selected_bands, list_mean=list_mean,
-                                            list_std=list_std, label_to_idx=label_to_idx, small_fraction=small_fraction)
+                                            list_std=list_std, small_fraction=small_fraction)
     
     logger.info(f'Size of train_dataset: {dataset_train.__len__()}')
     logger.info(f"Size of Val dataset: {dataset_val.__len__()}")
@@ -429,10 +467,9 @@ def main()->None:
     ## Create the dataloader 
     train_dl = loader_dataloader(dataset_train,            
                                     batch_size= config['training']['batch_size'],
-                                    shuffle = False,
+                                    shuffle = True,
                                     num_workers = 4,
                                     pin_memory = True)
-    logger.info(f"Train dataset validate")
 
     test_dl = loader_dataloader(dataset_test,            
                                     batch_size= config['training']['batch_size'],
@@ -456,6 +493,7 @@ def main()->None:
         pos_weight = dataset_train.calculate_unbalanced_df().to(device)
     else:
         pos_weight= None
+
     ## Define Optimizer, Scheduler and loss 
     optimizer, criterion, scheduler, scheduler_class = build_opt(model, config, pos_weight)
 
@@ -481,13 +519,14 @@ def main()->None:
     }
 
     best_val_loss=float('inf')
-    save_model= False
+    save_model= True
     train_losses = []
     val_losses = []
 
+    mlb = dataset_train.return_mlb() ## Get the multibinarizer instance for labels 
     for epoch in range(num_epochs):
-        train_loss, train_metrics = train_epoch_debug(model, train_dl, optimizer, criterion, device, train_metrics_tracker, sensitivity)
-        val_loss, val_metrics = validate(model, val_dl, criterion, device, val_metrics_tracker, sensitivity)
+        train_loss, train_metrics = train_epoch_debug(model, train_dl, optimizer, criterion, device, train_metrics_tracker, sensitivity, mlb)
+        val_loss, val_metrics = validate(model, val_dl, criterion, device, val_metrics_tracker, sensitivity,mlb)
 
         ## pass the scheduler for each step
         if scheduler:
@@ -508,9 +547,10 @@ def main()->None:
         dict_metrics['val_f1_score'].append(val_metrics['f1_score'])
         dict_metrics['val_precision'].append(val_metrics['precision'])
         dict_metrics['val_recall'].append(val_metrics['recall'])
+
         wandb_logger.log_train(epoch, train_loss, val_loss, current_lr, train_metrics, val_metrics)
 
-        save_model = False
+        save_model = True
 
         if config["training"]['save_strategy']=="loss":
             if val_loss < best_metric:

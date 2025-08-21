@@ -11,7 +11,6 @@ from tqdm import tqdm
 from torch.utils.data import DataLoader
 import pandas as pd
 from src.utils.utils import load_config
-from src.data.loader import bigearthnet_loader, bigearthnet_DataModule
 from src.utils.torch import seed_everything
 from src.model_zoo.models import define_model_, define_model_scratch
 from src.metrics.metrics import MultiLabelMetrics
@@ -114,27 +113,56 @@ def build_model(config):
 
 
 def build_opt(model, config, pos_weight):
-    optimizer_class = getattr(torch.optim, config['training']['optim'])
+    optimizer_class = getattr(torch.optim, config['training']['optim'])  ## Adam
 
     ## weight decay
-    weight_decay = config['training'].get('weight_decay', 0)
+    optim_name = config['training'].get('optim', 'Adam')
+    learning_rate = float(config['training'].get('learning_rate', 1e-4))
+    weight_decay = float(config['training'].get('weight_decay', 1e-4))
 
-    if config['training']['optim'] == 'Adam':
-        optimizer = optimizer_class(
-            model.parameters(),
-            lr=float(config['training']['learning_rate']),
-            weight_decay=float(weight_decay)
-        )
-    elif config['training']['optim'] == 'SGD':
-        logger.info(f"Adding Momentum to the given optimizer")
-        optimizer = optimizer_class(
-            model.parameters(),
-            lr=float(config['training']['learning_rate']),
-            momentum = config['training']['momentum_val'],
-            weight_decay= float(weight_decay)
-        )
+    logger.info(f"Optimizer: {optim_name}, LR: {learning_rate}, Weight decay: {weight_decay}")
+    
+    try:
+        optimizer_class = getattr(torch.optim, optim_name)
+        
+        if optim_name == 'Adam':
+            # Adam with conservative defaults for stable training
+            optimizer = optimizer_class(
+                model.parameters(),
+                lr=learning_rate,
+                weight_decay=weight_decay,
+                betas=(0.9, 0.999),  # Default betas
+                eps=1e-8,  # Default eps
+                amsgrad=False  # Can help with convergence in some cases
+            )
 
-    logger.info(f"Weight decay: {weight_decay}")
+        elif optim_name == 'SGD':
+            momentum = float(config['training'].get('momentum_val', 0.9))
+            nesterov = config['training'].get('nesterov', True)  # Nesterov momentum often helps
+            
+            if momentum <= 0 or momentum >= 1:
+                logger.warning(f"Momentum {momentum} may be problematic. Setting to 0.9")
+                momentum = 0.9
+                
+            logger.info(f"SGD with momentum: {momentum}, nesterov: {nesterov}")
+            optimizer = optimizer_class(
+                model.parameters(),
+                lr=learning_rate,
+                momentum=momentum,
+                weight_decay=weight_decay,
+                nesterov=nesterov
+            )
+        elif optim_name == 'AdamW':
+            optimizer = optimizer_class(
+                model.parameters(),
+                lr=learning_rate,
+                weight_decay=weight_decay,
+                betas=(0.9, 0.999),  # Default betas
+                eps=1e-8,  # Default eps
+                amsgrad=False  # Can help with convergence in some cases
+            )
+    except AttributeError:
+        raise ValueError(f"Optimizer '{optim_name}' not found in torch.optim")
 
     scheduler = config['training']['scheduler']
     scheduler_class = None
@@ -142,28 +170,44 @@ def build_opt(model, config, pos_weight):
     if scheduler:
         logger.info(f"scheduler type: {config['training']['scheduler_type']}")
         logger.info(f"scheduler factor: {config['training']['factor']}")
+
+        scheduler_type = config['training'].get('scheduler_type', 'ReduceLROnPlateau')
+        factor = float(config['training'].get('factor', 0.5))
         
-        lr_scheduler = getattr(torch.optim.lr_scheduler, config['training']['scheduler_type'])
         
-        # For ReduceLROnPlateau, add patience parameter
-        if config['training']['scheduler_type'] == 'ReduceLROnPlateau':
-            patience = config['training'].get('patience', 5)  #patience of 10
-            scheduler_class = lr_scheduler(
-                optimizer, 
-                mode='min', 
-                factor=config['training']['factor'],
-                patience=patience
-            )
-            logger.info(f"scheduler patience: {patience}")
-        else:
-            #change this if the scheduler is not ReduceLRonPlateaou
-            scheduler_class = lr_scheduler(optimizer, factor=config['training']['factor'])
+        try:
+            lr_scheduler = getattr(torch.optim.lr_scheduler, scheduler_type)
+            
+            if scheduler_type == 'ReduceLROnPlateau':
+                patience = int(config['training'].get('patience', 5))
+                min_lr = float(config['training'].get('min_lr', 1e-7))
+                
+                scheduler_class = lr_scheduler(
+                    optimizer, 
+                    mode='min', 
+                    factor=factor,
+                    patience=patience,
+                    min_lr=min_lr,
+                    threshold = 1e-3
+                )
+                logger.info(f"ReduceLROnPlateau: patience={patience}, min_lr={min_lr}")
+
+
+        except AttributeError:
+            logger.error(f"Scheduler '{scheduler_type}' not found in torch.optim.lr_scheduler")
+        except Exception as e:
+            logger.error(f"Error creating scheduler: {e}")
 
     ### Cross Entropy 
-    if pos_weight is not None:
-        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-    else:
-        criterion=nn.BCEWithLogitsLoss()
+    try:
+        if pos_weight is not None:
+            criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+        else:
+            criterion=nn.BCEWithLogitsLoss()
+    except Exception as e:
+        logger.error(f"Error creating loss function: {e}")
+        # Fallback to basic BCE loss
+        criterion = nn.BCEWithLogitsLoss()
 
     return optimizer, criterion, scheduler, scheduler_class
 
@@ -177,16 +221,26 @@ def train_epoch(model, train_loader, optimizer, criterion, device, metrics_track
         t.set_description("Training")
         for x_data, y_data in train_loader:
             x_data, y_data = x_data.to(device), y_data.to(device)
+
+            if len(y_data.shape) == 3 and y_data.shape[1] == 1:
+                            y_data = y_data.squeeze(1)  # [batch_size, num_classes]
+
             optimizer.zero_grad()
             outputs = model(x_data)
-            loss = criterion(outputs, y_data.squeeze().float()) ## add loss 
+
+            loss = criterion(outputs, y_data.float()) ## add loss 
             loss.backward() #compute gradient
-            optimizer.step()
 
-            out_sigmoid = torch.sigmoid(outputs)
-            outputs_sens = (out_sigmoid>sensitivity).float()
+            # Gradient clipping to prevent exploding gradients
+            ##torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
-            metrics_tracker.update(outputs_sens, y_data.squeeze())
+            optimizer.step() 
+            
+            with torch.no_grad():
+                out_sigmoid = torch.sigmoid(outputs)
+                outputs_sens = (out_sigmoid>sensitivity).float()
+                metrics_tracker.update(outputs_sens, y_data)
+            
             train_loss += loss.item()
             t.set_postfix(loss=loss.item())
             t.update(x_data.size(0))
@@ -204,9 +258,13 @@ def train_epoch_debug(model, train_loader, optimizer, criterion, device, metrics
             x_data, y_data = x_data.to(device), y_data.to(device)
             
             optimizer.zero_grad()
-            outputs = model(x_data)
+            outputs = model(x_data)   
 
-            loss = criterion(outputs, y_data.squeeze().float())
+            ## only squeeze if necessary
+            if len(y_data.shape) == 3 and y_data.shape[1] == 1:
+                y_data = y_data.squeeze(1)  #batch_size, num_classes
+
+            loss = criterion(outputs, y_data.float())
 
             # Debug loss and gradients
             if batch_idx == 0:
@@ -227,10 +285,12 @@ def train_epoch_debug(model, train_loader, optimizer, criterion, device, metrics
                 print(f"Gradient norm: {total_norm}")
 
             optimizer.step()
-            output_metrics = torch.sigmoid(outputs)
-            outputs_sens = (output_metrics>sensitivity).float()
-            
-                        # Debug prints for first batch
+
+            with torch.no_grad():
+                output_metrics = torch.sigmoid(outputs)
+                outputs_sens = (output_metrics>sensitivity).float()
+                metrics_tracker.update(outputs_sens, y_data)
+
             if batch_idx == 0:
                 print(f"Input shape: {x_data.shape}")
                 print(f"Label shape: {y_data.shape}")
@@ -251,7 +311,6 @@ def train_epoch_debug(model, train_loader, optimizer, criterion, device, metrics
                     print(f"mlb gt: {mlb.inverse_transform(i.reshape(1,-1))}")
                 print(f"Output shape: {outputs.shape}")
 
-            metrics_tracker.update(outputs_sens, y_data.squeeze())
             train_loss += loss.item()
             t.set_postfix(loss=loss.item())
             t.update(x_data.size(0))
@@ -271,8 +330,19 @@ def validate(model, val_loader, criterion, device, metrics_tracker, sensitivity,
             t.set_description("Validation")
             for batch_idx, (x_data, y_data) in enumerate(val_loader):
                 x_data, y_data = x_data.to(device), y_data.to(device)
+
                 outputs = model(x_data)
-                loss = criterion(outputs, y_data.squeeze().float())
+
+                ## only squeeze if necessary
+                if len(y_data.shape) == 3 and y_data.shape[1] == 1:
+                    y_data = y_data.squeeze(1)  #batch_size, num_classes
+
+                loss = criterion(outputs, y_data.float())
+
+                # Check for invalid loss values
+                if torch.isnan(loss) or torch.isinf(loss):
+                    logger.warning(f"Invalid loss at batch {batch_idx}: {loss.item()}")
+                    continue
 
                 output_metrics = torch.sigmoid(outputs)
                 outputs_sens = (output_metrics>sensitivity).float()
@@ -298,7 +368,7 @@ def validate(model, val_loader, criterion, device, metrics_tracker, sensitivity,
                         print(f"mlb gt: {mlb.inverse_transform(i.reshape(1,-1))}")
                     print(f"Output shape: {outputs.shape}")
 
-                metrics_tracker.update(outputs_sens, y_data.squeeze())
+                metrics_tracker.update(outputs_sens, y_data)
                 val_loss += loss.item()
                 t.set_postfix(loss=loss.item())
                 t.update(x_data.size(0))
@@ -318,11 +388,16 @@ def test_model(model, test_loader, criterion, device, metrics_tracker, sensitivi
             for x_data, y_data in test_loader:
                 x_data, y_data = x_data.to(device), y_data.to(device)
                 outputs = model(x_data)
-                loss = criterion(outputs, y_data.squeeze().float())
+
+                ## only squeeze if necessary
+                if len(y_data.shape) == 3 and y_data.shape[1] == 1:
+                    y_data = y_data.squeeze(1)  #batch_size, num_classes
+
+                loss = criterion(outputs, y_data.float())
                 out_sigmoid = torch.sigmoid(outputs)
                 outputs_sens = (out_sigmoid>sensitivity).float()
                 
-                metrics_tracker.update(outputs_sens, y_data.squeeze())
+                metrics_tracker.update(outputs_sens, y_data)
                 test_loss += loss.item()
                 t.set_postfix(loss=loss.item())
                 t.update(x_data.size(0))
@@ -580,7 +655,6 @@ def main()->None:
     
 
     ## Populate the dataset with the test 
-
     model.load_state_dict(torch.load(os.path.join(checkpoint_path, 'best_model.pth')))
     test_loss, test_metrics = test_model(model, test_dl, criterion, device, test_metrics_tracker, sensitivity)
 

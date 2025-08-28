@@ -22,6 +22,7 @@ from sklearn.preprocessing import MultiLabelBinarizer
 import torch
 import torch.nn.functional as F
 from sklearn.preprocessing import minmax_scale
+import albumentations as A
 
 ## Global  variables
 means_s2 = {
@@ -363,6 +364,7 @@ class Dataset_BigEarthNet:
         return_patch_id=False,
         patch_ids=None,
         dict_one_hot={},
+        albumentations= False
 
     ):
         """
@@ -391,6 +393,8 @@ class Dataset_BigEarthNet:
                 Split the idx list into the choice, either: Train, Test or Val
             dict_one_hot: dict
                 Dict of labels for one-hot encoding
+            albumentations: bool. default False.
+                Implement Albumentations package for image augmentation
             
         """
         
@@ -404,6 +408,7 @@ class Dataset_BigEarthNet:
         self.transform = transform
         self.return_patch_id = return_patch_id
         self.small_fraction = small_fraction
+        self.albumentations = albumentations
 
         ## This store the MultiLabelBinarizer, which is the class to transform in one-hot-encoding
         self.mlb_labels_  = None
@@ -563,6 +568,22 @@ class Dataset_BigEarthNet:
         
         return stacked_bands
 
+    def albumentations_pipeline(self, p=0.5):
+        """ Implements Image Augmentation.
+            p: float (default 0.5)
+                Probability of albumentation be applied to the image at every call.
+        """
+        essential_pipeline = A.Compose([
+            A.SquareSymmetry(p=p), ##This rotates the image for 8 possible  square simetry transformations
+            A.RandomBrightnessContrast(p= p-0.1,
+                                       brightness_limit=(-0.1,0.1),
+                                       contrast_limit=(-0.2,0.2)
+                                       ),## Randomly changes the brightness and contrats
+            A.GaussianBlur(sigma_limit=(0.5,2),blur_limit = 3, p=p-0.1)
+
+        ])
+        return essential_pipeline
+
     def __getitem__(self, idx: int) -> Union[Tuple[torch.Tensor, Any], Tuple[torch.Tensor, Any, str]]:
         """Get item by index"""
         # Get patch_id from the array
@@ -587,6 +608,18 @@ class Dataset_BigEarthNet:
             if self.transform is not None:
                 img_tensor = self.transform(img_tensor)
 
+            ## Albumentations
+            try:
+                if self.transform and self.albumentations and self.split_train_test=='train': #only apply training
+                    #convert numpy
+                    img_numpy = img_tensor.permute(1,2,0).numpy() #C,H,W ->  W,H,C
+                    augmentation_pipeline = self.albumentations_pipeline()
+                    augmented = augmentation_pipeline(image=img_numpy)
+                    img_tensor = torch.from_numpy(augmented['image']).permute(2,0,1) #C,H,W
+                    
+            except Exception as e:
+                logger.error(f"Error within augmentation")
+            
             # Return data
             if self.return_patch_id:
                 return img_tensor, labels_onehot, patch_id

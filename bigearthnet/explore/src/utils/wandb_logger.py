@@ -7,10 +7,11 @@ class WandbLogger:
         self.bands = config['model']['select_bands']
 
         if self.use_wandb:
-            wandb.init(project=config['WANDB']['project_name'], config=config)
-            if name_run is None:
-                name_run = result_dir['timestamp']
-            wandb.run.name = name_run
+            wandb.init(project=config['WANDB']['project_name'], config=config,
+                       name = name_run,
+                       #reinit=True
+                       )
+           # wandb.run.name = name_run
             self.run = wandb.run
             logger.info(f"Initialized Weights & Biases run: {self.run.name}")
         else:
@@ -115,7 +116,21 @@ class WandbLogger:
             )
 
         wandb.log(log_data)
+    def log_test_batch(self, batch_idx, batch_loss, batch_metrics):
+        """Log individual batch metrics during testing"""
+        wandb.log({
+            "test_batch_loss": batch_loss,
+            "test_batch_accuracy": batch_metrics['accuracy'],
+            "test_batch_f1_score": batch_metrics['f1_score'],
+            "test_batch_precision": batch_metrics['precision'],
+            "test_batch_recall": batch_metrics['recall'],
+            "test_batch_idx": batch_idx
+        })
 
     def save_model(self, model_path):
         if self.use_wandb:
             wandb.save(model_path)
+
+    def finish(self):
+        if self.use_wandb:
+            wandb.finish()

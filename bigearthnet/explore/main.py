@@ -1,6 +1,7 @@
 import yaml
 import os
 from datetime import datetime
+import time
 from loguru import logger  
 import torch 
 import random
@@ -60,6 +61,9 @@ def save_config_to_log(config, log_dir, filename="config.yaml"):
 ## Build up model by definition 
 def reader_(config_dataset):
     """ Create a class that handles the retrieval of tif files. 
+        The class look into folder structure to find each one of the .tif files (bands)
+        belonging to a certain patch of a given tile.
+    This class is composing the BigEarthDataset.
     """
     reader = Reader(
         root_folder_path=config_dataset["datasets"]["root"],
@@ -68,7 +72,7 @@ def reader_(config_dataset):
     return reader 
 
 def loader_dataset(train_test_split,reader, config, name_selected_bands, 
-                    list_mean, list_std, small_fraction=None,
+                    list_mean, list_std, albumentation=False, small_fraction=None
                     ):
     """
     Create a torch DataSet class that will iterate be passed on a datamodule
@@ -85,7 +89,8 @@ def loader_dataset(train_test_split,reader, config, name_selected_bands,
             transforms.Normalize(mean=list_mean, std=list_std),
             transforms.Resize([224,224])
         ]),
-        return_patch_id=False
+        return_patch_id=False,
+        albumentations=albumentation
         )
 
 def loader_dataloader(dataset,**kwargs):
@@ -180,7 +185,7 @@ def build_opt(model, config, pos_weight):
             
             if scheduler_type == 'ReduceLROnPlateau':
                 patience = int(config['training'].get('patience', 5))
-                min_lr = float(config['training'].get('min_lr', 1e-7))
+                min_lr = float(config['training'].get('min_lr', 1e-6))
                 
                 scheduler_class = lr_scheduler(
                     optimizer, 
@@ -197,19 +202,71 @@ def build_opt(model, config, pos_weight):
             logger.error(f"Scheduler '{scheduler_type}' not found in torch.optim.lr_scheduler")
         except Exception as e:
             logger.error(f"Error creating scheduler: {e}")
+    
+    ## EARLYSTOP
+    logger.info(f"Early Stop info: {config["training"]["early_stop"]}")
+    if config['training']["early_stop"]==True:
+        early_stopping_patience = int(config['training'].get('early_stopping_patience', 10))
+        min_delta = float(config['training'].get('early_stopping_min_delta', 0.0001))
+        early_stopping = EarlyStopping(patience=early_stopping_patience, min_delta=min_delta)
+        logger.success(f"Early stopping: patience={early_stopping_patience}, min_delta={min_delta}")
+    else:
+        early_stopping = False
 
-    ### Cross Entropy 
+    ### BINARY CROSS ENTROPY 
+    # Cross Entropy 
     try:
+        ## Add positional weights into the BCE 
         if pos_weight is not None:
             criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
         else:
-            criterion=nn.BCEWithLogitsLoss()
+            criterion= nn.BCEWithLogitsLoss()
     except Exception as e:
         logger.error(f"Error creating loss function: {e}")
-        # Fallback to basic BCE loss
         criterion = nn.BCEWithLogitsLoss()
 
-    return optimizer, criterion, scheduler, scheduler_class
+    return optimizer, criterion, scheduler, scheduler_class, early_stopping
+
+class EarlyStopping:
+    """Early stops the training if validation loss doesn't improve after a given patience and certain delta."""
+    def __init__(self, patience=7, min_delta=0, restore_best_weights=True):
+        """
+        Args:
+            patience (int): How long to wait after last time validation loss improved.
+                            Default: 7
+            min_delta (float): Minimum change in the monitored quantity to qualify as an improvement.
+                            Default: 0
+            restore_best_weights (bool): Whether to restore model weights from the best epoch.
+                                       Default: True
+        """
+        self.patience = patience
+        self.min_delta = min_delta
+        self.restore_best_weights = restore_best_weights
+        self.best_loss = None
+        self.counter = 0
+        self.best_weights = None
+        
+    def __call__(self, val_loss, model):
+        if self.best_loss is None:
+            self.best_loss = val_loss
+            self.save_checkpoint(model)
+        elif val_loss < self.best_loss - self.min_delta:
+            self.best_loss = val_loss
+            self.counter = 0
+            self.save_checkpoint(model)
+        else:
+            self.counter += 1
+            
+        if self.counter >= self.patience:
+            if self.restore_best_weights:
+                model.load_state_dict(self.best_weights)
+            return True
+        return False
+    
+    def save_checkpoint(self, model):
+        '''Saves model when validation loss decrease.'''
+        if self.restore_best_weights:
+            self.best_weights = model.state_dict().copy()
 
 
 def train_epoch(model, train_loader, optimizer, criterion, device, metrics_tracker, sensitivity):
@@ -381,11 +438,13 @@ def test_model(model, test_loader, criterion, device, metrics_tracker, sensitivi
     model.eval()
     metrics_tracker.reset()
     test_loss = 0.0
+    batch_losses = []
+    batch_metrics = []
 
     with torch.no_grad():
         with tqdm(total=len(test_loader.dataset), ncols=100, colour='#cc99ff') as t:
             t.set_description("Testing")
-            for x_data, y_data in test_loader:
+            for batch_idx, (x_data, y_data) in enumerate(test_loader):
                 x_data, y_data = x_data.to(device), y_data.to(device)
                 outputs = model(x_data)
 
@@ -397,12 +456,31 @@ def test_model(model, test_loader, criterion, device, metrics_tracker, sensitivi
                 out_sigmoid = torch.sigmoid(outputs)
                 outputs_sens = (out_sigmoid>sensitivity).float()
                 
+                # Create temporary metrics tracker for batch-level metrics
+                temp_metrics = MultiLabelMetrics(num_classes=outputs_sens.shape[1]).to(device)
+                temp_metrics.update(outputs_sens, y_data)
+                batch_metrics_dict = temp_metrics.compute()
+
+                # Store batch results
+                batch_losses.append(loss.item())
+                batch_metrics.append(batch_metrics_dict)
+
                 metrics_tracker.update(outputs_sens, y_data)
+
+                batch_losses.append({
+                    'batch': batch_idx,
+                    'loss': loss.item(),
+                    'accuracy': batch_metrics_dict['accuracy'],
+                    'f1_score': batch_metrics_dict['f1_score'],
+                    'precision': batch_metrics_dict['precision'],
+                    'recall': batch_metrics_dict['recall']
+                })
+
                 test_loss += loss.item()
                 t.set_postfix(loss=loss.item())
                 t.update(x_data.size(0))
 
-    return test_loss / len(test_loader), metrics_tracker.compute()
+    return test_loss / len(test_loader), metrics_tracker.compute(), batch_losses, batch_metrics
 
 
 def save_all_metrics(dict_metrics, test_metrics, bands, num_epochs, save_path, train_losses, val_losses):
@@ -447,222 +525,299 @@ def save_all_metrics(dict_metrics, test_metrics, bands, num_epochs, save_path, t
     logger.info(f"Saved train/val losses to {loss_path}")
 
 
+def find_all_files(folder_path):
+    """
+    Find all config files inside a folder
+    folder_path: str
+        path holding all the config yaml files.
+    """
+    all_files = []
+    for root, dirs, files in os.walk(folder_path):
+        for file in files:
+            all_files.append(os.path.join(root, file))
+    return all_files
+
+
 ## track emission 
-#@track_emissions(save_to_api=True,logging_logger=False, log_level='critical')
+@track_emissions(save_to_api=True,
+                logging_logger=False,
+                save_to_logger=False,
+                log_level=None,
+                save_to_file=False)
 def main()->None:
 
-    ## Create out dirs
-    paths = create_result_dirs()
-    log_path = paths['log_path']
-    checkpoint_path = paths['checkpoint_path']
-    metrics_path = paths['metrics_path']
+    config_dir = os.path.join(os.getcwd(),"src/config")
 
-    ## Load yaml file with configs
-    config = load_config("src/config/config.yaml")
+    ## Get all config files inside the folder 
+    list_of_config_files = find_all_files(config_dir)
 
-    ## MLB 
-    df_parquet = pd.read_parquet(config['datasets']['metadata_parquet'])
+    ## Loop over the config files 
+    for config_file_path in list_of_config_files:
+        ## Create out dirs
+        config = load_config(config_file_path)
 
-    sensitivity = config['training']['sensitivity']
-    logger.info(f"Sensitivity:{sensitivity}")
-    num_epochs = config['training']['n_epoch']
-    selected_bands = config['model']['select_bands']
-    dict_sentinel2_bands =  config['model']['sentinel2_bands']
-    name_selected_bands = [dict_sentinel2_bands[b] for b in selected_bands]
+        logger.success(f"Logged at the file {config_file_path.split("/")[-1:]}")
 
-    logger.info(f"Number of selected bands: {len(selected_bands)}")
-    logger.info(f"Selected Bands:{name_selected_bands}")
+        ## Create folder to output results
+        paths = create_result_dirs()
+        log_path = paths['log_path']
+        checkpoint_path = paths['checkpoint_path']
+        metrics_path = paths['metrics_path']
 
-    small_fraction = config['training']['slice_of_training']
-    if int(small_fraction)==int(1.0):
-        small_fraction = None
-    else: 
-        logger.info(f"Fraction of training data: {small_fraction}")
+        ## Select variables from config.yaml
+        sensitivity = config['training']['sensitivity']
+        logger.info(f"Sensitivity:{sensitivity}")
+        num_epochs = config['training']['n_epoch']
+        selected_bands = config['model']['select_bands']
+        dict_sentinel2_bands =  config['model']['sentinel2_bands']
+        logger.info(f"Number of selected bands: {len(selected_bands)}")
 
-    # Initialize best metrics at the beginning of training
-    if config['training']['save_strategy'] == "loss":
-        best_metric = float('inf')  # For loss, lower is better
-        logger.info("Model will be saved based on validation loss")
-    else:  # metric-based saving
-        metric_name = config['training']['save_metric']
-        save_mode = config['training']['save_mode']
-        best_metric = float('inf') if save_mode == "min" else float('-inf')
-        logger.info(f"Model will be saved based on average {metric_name} ({save_mode})")
 
-    ## SETUP env
-    setup_environment(config,log_path)
-    if config['training']['positional_weight']==True:
-        ps_str = 'PS'
-    else:
-        ps_str = '-'
-    save_config_to_log(config, paths['result_dir'])
-    name_run = f"{str(len(selected_bands))}B" +f"-{sensitivity}sens" + f"-{str(config['training']['learning_rate'])}LR"+ f"{str(config['training']['weight_decay'])}WD"+f"-{ps_str}"##+##f"{str(paths['result_dir']['timestamp'])}"
-    logger.warning(f"Run name: {name_run}")
-    # set up weight and bias to track experiment
-    wandb_logger = WandbLogger(config=config, result_dir=paths, name_run = name_run)
+        ## transform index selection into named for debugging
+        name_selected_bands = [dict_sentinel2_bands[b] for b in selected_bands]
+        logger.info(f"Selected Bands:{name_selected_bands}")
 
-    ## Create the Reader
-    reader = reader_(config)
-    logger.success("Reader READY")
-
-    ## Select the dict containg the Std and Mean for each band
-    mean_dict, std_dict = get_right_dict(s2_dict_mean=means_s2,
-                                         s2_dict_std=stds_s2,
-                                         upsampling_method=config['datasets']['upsampling_method'])
-    
-    ## select only the mean and std for the given selected_bands 
-    list_mean, list_std = get_list_means_std(mean_dict=mean_dict,
-                                             std_dict=std_dict,
-                                            strip_bands=name_selected_bands
-                                            )
-    # list_mean =[0.485, 0.456, 0.406]  # RGB order
-    # list_std=[0.229, 0.224, 0.225]   # RGB order
-    
-    logger.info(f"List of average and stardard desviation ready: Mean= {list_mean} | Std {list_std} for bands |{selected_bands}")
-
-    ## Create dataset instance
-    dataset_train = loader_dataset('train',reader=reader, config=config,
-                                            name_selected_bands=name_selected_bands, list_mean=list_mean,
-                                            list_std=list_std, small_fraction=small_fraction
-
-                                            )
-
-    dataset_val = loader_dataset('validation',reader=reader, config=config,
-                                            name_selected_bands=name_selected_bands, list_mean=list_mean,
-                                            list_std=list_std, small_fraction=small_fraction)
-
-    dataset_test = loader_dataset('test',reader=reader, config=config,
-                                            name_selected_bands=name_selected_bands, list_mean=list_mean,
-                                            list_std=list_std, small_fraction=small_fraction)
-    
-    logger.info(f'Size of train_dataset: {dataset_train.__len__()}')
-    logger.info(f"Size of Val dataset: {dataset_val.__len__()}")
-    logger.info(f"Size of Teste dataset: {dataset_test.__len__()}")
-    
-    ## Create the dataloader 
-    train_dl = loader_dataloader(dataset_train,            
-                                    batch_size= config['training']['batch_size'],
-                                    shuffle = True,
-                                    num_workers = 4,
-                                    pin_memory = True)
-
-    test_dl = loader_dataloader(dataset_test,            
-                                    batch_size= config['training']['batch_size'],
-                                    shuffle = False,
-                                    num_workers = 4,
-                                    pin_memory = True)
-    
-    val_dl = loader_dataloader(dataset_val,            
-                                    batch_size= config['training']['batch_size'],
-                                    shuffle = False,
-                                    num_workers = 4,
-                                    pin_memory = True)
-    
-    ## Create the model 
-    model, device = build_model(config)
-    
-    
-    ## Calculate the positional weight
-    if config['training']['positional_weight']==True:
-        logger.warning(f"Calculate positional weight activate")
-        pos_weight = dataset_train.calculate_unbalanced_df().to(device)
-    else:
-        pos_weight= None
-
-    ## Define Optimizer, Scheduler and loss 
-    optimizer, criterion, scheduler, scheduler_class = build_opt(model, config, pos_weight)
-
-    ## Define Metrics Tracker 
-    train_metrics_tracker = MultiLabelMetrics(num_classes=config["model"]["num_classes"]).to(device)
-    val_metrics_tracker = MultiLabelMetrics(num_classes=config["model"]["num_classes"]).to(device)
-    test_metrics_tracker = MultiLabelMetrics(num_classes=config["model"]["num_classes"]).to(device)
-
-    # test_metrics_tracker = MultiClasses(num_classes=config["model"]["num_classes"])
-
-    dict_metrics = {
-        'train_accuracy': [],
-        'train_f1_score': [],
-        'train_precision': [],
-        'train_recall': [],
-        'train_acc_per_class':[],
-        'val_accuracy': [],
-        'val_f1_score': [],
-        'val_precision': [],
-        'val_recall': [],
-        'val_acc_per_class':[]
-
-    }
-
-    best_val_loss=float('inf')
-    save_model= True
-    train_losses = []
-    val_losses = []
-
-    mlb = dataset_train.return_mlb() ## Get the multibinarizer instance for labels 
-    for epoch in range(num_epochs):
-        train_loss, train_metrics = train_epoch_debug(model, train_dl, optimizer, criterion, device, train_metrics_tracker, sensitivity, mlb)
-        val_loss, val_metrics = validate(model, val_dl, criterion, device, val_metrics_tracker, sensitivity,mlb)
-
-        ## pass the scheduler for each step
-        if scheduler:
-            scheduler_class.step(val_loss)
+        ## either implements image augmentation - albumentation
+        albumentation = config['training']['albumentation']
+        if albumentation==True:
+            logger.info(f"Albumentation is added: {albumentation}")
         
-        # check and modified if necessary
-        current_lr = optimizer.param_groups[0]['lr']
-        logger.info(f"Current learning rate: {current_lr:.8f}")
-        logger.info(f"Epoch {epoch+1}: Train Loss= {train_loss:.6f}, Val Loss={val_loss:.6f}")
-
-        ## Add everything to the dict_metrics
-        dict_metrics['train_accuracy'].append(train_metrics['accuracy'])
-        dict_metrics['train_f1_score'].append(train_metrics['f1_score'])
-        dict_metrics['train_precision'].append(train_metrics['precision'])
-        dict_metrics['train_recall'].append(train_metrics['recall'])
-
-        dict_metrics['val_accuracy'].append(val_metrics['accuracy'])
-        dict_metrics['val_f1_score'].append(val_metrics['f1_score'])
-        dict_metrics['val_precision'].append(val_metrics['precision'])
-        dict_metrics['val_recall'].append(val_metrics['recall'])
-
-        wandb_logger.log_train(epoch, train_loss, val_loss, current_lr, train_metrics, val_metrics)
-
-        save_model = True
-
-        if config["training"]['save_strategy']=="loss":
-            if val_loss < best_metric:
-                best_metric = val_loss
-                save_model = True
-                save_message = f"Best model saved at epoch {epoch+1} with Val Loss: { best_metric:.6f}"
+        ## how much of the dataset is used for training
+        ## usually take a fraction for quicker analysis and new implementations test
+        small_fraction = config['training']['slice_of_training']
+        if int(small_fraction)==int(1.0):
+            small_fraction = None
         else: 
+            logger.warning(f"Fraction of training data: {small_fraction}")
+
+        # Initialize best metrics at the beginning of training
+        if config['training']['save_strategy'] == "loss":
+            best_metric = float('inf')  # For loss, lower is better
+            logger.info("Model will be saved based on validation loss")
+        else:  # metric-based saving
             metric_name = config['training']['save_metric']
             save_mode = config['training']['save_mode']
-            avg_metric = val_metrics.get(metric_name, 0.0) 
-
-            if (save_mode == "min" and avg_metric < best_metric) or \
-            (save_mode == "max" and avg_metric > best_metric):
-                best_metric = avg_metric
-                save_model = True
-                save_message = f"Best model saved at epoch {epoch+1} with avg {metric_name}: {best_metric:.6f}"
+            best_metric = float('inf') if save_mode == "min" else float('-inf')
+            logger.info(f"Model will be saved based on average {metric_name} ({save_mode})")
         
-         # Save model if criteria met
-        if save_model:
-            model_path = os.path.join(checkpoint_path, "best_model.pth")
-            torch.save(model.state_dict(), model_path)
-            #wandb_logger.save_model(model_path)
-            logger.info(save_message)
 
-        train_losses.append(train_loss)
-        val_losses.append(val_loss)
-    
+        ## SETUP ENVIRONMENT 
+        setup_environment(config,log_path)
+        save_config_to_log(config, paths['result_dir'])
 
-    ## Populate the dataset with the test 
-    model.load_state_dict(torch.load(os.path.join(checkpoint_path, 'best_model.pth')))
-    test_loss, test_metrics = test_model(model, test_dl, criterion, device, test_metrics_tracker, sensitivity)
+        ## COMPOSE Name of the model saved at WEIGHTS AND BIAS 
+        if config['training']['positional_weight']==True:
+            ps_str = 'PS'
+        else:
+            ps_str = '-'
+        
+        if albumentation == True:
+            name_albu = "-AUG"
+        else: 
+            name_albu = ""
 
-    wandb_logger.log_test(test_loss, test_metrics)
+        model_name_str = str(config['model']['model_name'])
+        name_run = f"{config_file_path.split("/")[-1:]}-{model_name_str}-{str(len(selected_bands))}B-{sensitivity}sens-{str(config['training']['learning_rate'])}LR{str(config['training']['weight_decay'])}WD-{ps_str}{name_albu}"
 
-    # # save all metrics
-    save_all_metrics(dict_metrics, test_metrics, selected_bands, num_epochs, metrics_path, train_losses, val_losses)
+        ## Name of the run 
+        logger.warning(f"Run name: {name_run}")
 
+
+        # set up weight and bias to track experiment
+        wandb_logger = WandbLogger(config=config, result_dir=paths, name_run = name_run)
+
+        ## Create the Reader
+        reader = reader_(config)
+        logger.success("Reader READY")
+
+        ## Select the dict containg the Std and Mean for each band
+        mean_dict, std_dict = get_right_dict(s2_dict_mean=means_s2,
+                                            s2_dict_std=stds_s2,
+                                            upsampling_method=config['datasets']['upsampling_method'])
+        
+        ## select only the mean and std for the given selected_bands 
+        list_mean, list_std = get_list_means_std(mean_dict=mean_dict,
+                                                std_dict=std_dict,
+                                                strip_bands=name_selected_bands
+                                                )
+        
+        ## Below, it is mean and std of ImageNET1000K
+        # list_mean =[0.485, 0.456, 0.406]  # RGB order
+        # list_std=[0.229, 0.224, 0.225]   # RGB order
+        
+        logger.info(f"List of average and stardard desviation ready: Mean= {list_mean} | Std {list_std} for bands |{selected_bands}")
+
+        ## Create dataset instance
+        dataset_train = loader_dataset('train',reader=reader, config=config,
+                                                name_selected_bands=name_selected_bands, list_mean=list_mean,
+                                                list_std=list_std, small_fraction=small_fraction,
+                                                albumentation=albumentation  ##only for training
+                                                )
+
+        dataset_val = loader_dataset('validation',reader=reader, config=config,
+                                                name_selected_bands=name_selected_bands, list_mean=list_mean,
+                                                list_std=list_std, small_fraction=small_fraction)
+
+        dataset_test = loader_dataset('test',reader=reader, config=config,
+                                                name_selected_bands=name_selected_bands, list_mean=list_mean,
+                                                list_std=list_std, small_fraction=small_fraction)
+        
+        logger.info(f'Size of train_dataset: {dataset_train.__len__()}')
+        logger.info(f"Size of Val dataset: {dataset_val.__len__()}")
+        logger.info(f"Size of Teste dataset: {dataset_test.__len__()}")
+        
+        ## Create the dataloader 
+        train_dl = loader_dataloader(dataset_train,            
+                                        batch_size= config['training']['batch_size'],
+                                        shuffle = True,
+                                        num_workers = 4,
+                                        pin_memory = True)
+
+        test_dl = loader_dataloader(dataset_test,            
+                                        batch_size= config['training']['batch_size'],
+                                        shuffle = False,
+                                        num_workers = 4,
+                                        pin_memory = True)
+        
+        val_dl = loader_dataloader(dataset_val,            
+                                        batch_size= config['training']['batch_size'],
+                                        shuffle = False,
+                                        num_workers = 4,
+                                        pin_memory = True)
+        
+        ## Create the model and pass CUDA
+        model, device = build_model(config)
+        
+        
+        ## Calculate the positional weight
+        if config['training']['positional_weight']==True:
+            logger.warning(f"Calculate positional weight activate")
+            pos_weight = dataset_train.calculate_unbalanced_df().to(device)
+        else:
+            pos_weight= None
+
+        ## Define Optimizer, Scheduler and loss 
+        optimizer, criterion, scheduler, scheduler_class, early_stopping = build_opt(model, config, pos_weight)
+
+        ## Define Metrics Tracker 
+        train_metrics_tracker = MultiLabelMetrics(num_classes=config["model"]["num_classes"]).to(device)
+        val_metrics_tracker = MultiLabelMetrics(num_classes=config["model"]["num_classes"]).to(device)
+        test_metrics_tracker = MultiLabelMetrics(num_classes=config["model"]["num_classes"]).to(device)
+
+        dict_metrics = {
+            'train_accuracy': [],
+            'train_f1_score': [],
+            'train_precision': [],
+            'train_recall': [],
+            'train_acc_per_class':[],
+            'val_accuracy': [],
+            'val_f1_score': [],
+            'val_precision': [],
+            'val_recall': [],
+            'val_acc_per_class':[]
+        }
+
+        best_val_loss=float('inf')
+        save_model= True
+        train_losses = []
+        val_losses = []
+
+        ## get current epoch in case of EarlyStop
+        current_epoch = 0
+
+        ## Retrieves the mlb instance which allows multi-binaries to be labeled back 
+        mlb = dataset_train.return_mlb() ## Get the multibinarizer instance for labels 
+
+        ## Start loop
+        for epoch in range(num_epochs):
+            current_epoch += 1
+            train_loss, train_metrics = train_epoch_debug(model, train_dl, optimizer, criterion, device, train_metrics_tracker, sensitivity, mlb)
+            val_loss, val_metrics = validate(model, val_dl, criterion, device, val_metrics_tracker, sensitivity,mlb)
+
+            ## pass the scheduler for each step
+            if scheduler:
+                scheduler_class.step(val_loss)
+            
+            # check and modified if necessary
+            current_lr = optimizer.param_groups[0]['lr']
+            logger.info(f"Current learning rate: {current_lr:.8f}")
+            logger.info(f"Epoch {epoch+1}: Train Loss= {train_loss:.6f}, Val Loss={val_loss:.6f}")
+
+            ## Add everything to the dict_metrics
+            dict_metrics['train_accuracy'].append(train_metrics['accuracy'])
+            dict_metrics['train_f1_score'].append(train_metrics['f1_score'])
+            dict_metrics['train_precision'].append(train_metrics['precision'])
+            dict_metrics['train_recall'].append(train_metrics['recall'])
+            dict_metrics['val_accuracy'].append(val_metrics['accuracy'])
+            dict_metrics['val_f1_score'].append(val_metrics['f1_score'])
+            dict_metrics['val_precision'].append(val_metrics['precision'])
+            dict_metrics['val_recall'].append(val_metrics['recall'])
+
+            wandb_logger.log_train(epoch, train_loss, val_loss, current_lr, train_metrics, val_metrics)
+
+            save_model = True
+
+            if config["training"]['save_strategy']=="loss":
+                if val_loss < best_metric:
+                    best_metric = val_loss
+                    save_model = True
+                    save_message = f"Best model saved at epoch {epoch+1} with Val Loss: { best_metric:.6f}"
+            else: 
+                metric_name = config['training']['save_metric']
+                save_mode = config['training']['save_mode']
+                avg_metric = val_metrics.get(metric_name, 0.0) 
+
+                if (save_mode == "min" and avg_metric < best_metric) or \
+                (save_mode == "max" and avg_metric > best_metric):
+                    best_metric = avg_metric
+                    save_model = True
+                    save_message = f"Best model saved at epoch {epoch+1} with avg {metric_name}: {best_metric:.6f}"
+            
+            # Save model if criteria met
+            if save_model:
+                model_path = os.path.join(checkpoint_path, "best_model.pth")
+                torch.save(model.state_dict(), model_path)
+                #wandb_logger.save_model(model_path)
+                logger.info(save_message)
+
+            train_losses.append(train_loss)
+            val_losses.append(val_loss)
+
+            
+            ## EARLYSTOP
+            if config['training']['early_stop']== True:
+                if early_stopping(val_loss, model):
+                    logger.info(f"Early stopping triggered at epoch {epoch+1}")
+                    logger.info(f"Best validation loss was: {early_stopping.best_loss:.6f}")
+                    break
+        
+
+        ## Populate the dataset with the test 
+        model.load_state_dict(torch.load(os.path.join(checkpoint_path, 'best_model.pth')))
+        test_loss, test_metrics, batch_losses, batch_metrics = test_model(model, test_dl, criterion, device, test_metrics_tracker, sensitivity)
+
+        wandb_logger.log_test(test_loss, test_metrics)
+
+        for batch_idx, (batch_loss, batch_metric) in enumerate(zip(batch_losses, batch_metrics)):
+            wandb_logger.log_test_batch(batch_idx, batch_loss, batch_metric)
+
+
+        # # save all metrics
+        logger.info(f"Dict metrics: {len(dict_metrics)}")
+        logger.info(f"tRAIN ACC Dict metrics: {len(dict_metrics['train_accuracy'])}")
+        logger.info(f"tRAIN ACC Dict metrics: {len(dict_metrics['val_accuracy'])}")
+        logger.info(f"Print epoch {current_epoch}")
+        logger.info(f"test_metrics: {len(test_metrics)}")
+        logger.info(f"train_losses: {len(train_losses)}")
+        logger.info(f"val losses {len(val_losses)}")
+        logger.info(f"Dict metrics: {dict_metrics}")
+        logger.info(f"test_metrics: {test_metrics}")
+        logger.info(f"train_losses: {train_losses}")
+        logger.info(f"val losses {val_losses}")
+        
+        save_all_metrics(dict_metrics, test_metrics, selected_bands, current_epoch, metrics_path, train_losses, val_losses)
+
+        wandb_logger.finish()
 
 
 if __name__ == "__main__":

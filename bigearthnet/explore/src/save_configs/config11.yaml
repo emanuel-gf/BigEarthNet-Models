@@ -8,10 +8,10 @@ datasets:
 
 
 model: 
-  model_name: "vit_small_patch32_224"
+  model_name: "resnet50"
   pretrained: False
   num_classes: 19
-  select_bands: [1,2,3,4,5,6,9,11,12]  ##[3,2,1] #RGB
+  select_bands: [1,2,3,4]  ##[3,2,1] #RGB
   sentinel2_bands: {
                       0:  'B01',
                       1:  'B02',
@@ -29,8 +29,8 @@ model:
                       }
 
 training:
-  positional_weight: False
-  sensitivity: 0.43
+  positional_weight: True
+  sensitivity: 0.55
   seed: 41
   learning_rate: 1e-3
   scheduler: True
@@ -49,10 +49,6 @@ training:
   save_mode: max
   slice_of_training: 1.0
   albumentation: False
-  early_stop: False
-  early_stopping_patience: 5
-  early_stopping_min_delta: 1e-3
-
 
 WANDB:
   track: True

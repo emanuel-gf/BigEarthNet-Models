@@ -1,8 +1,12 @@
 # BigEarthNet - Deep Learning Models
 
+![bigearth](imgs/bigearthnet1.jpg)
+
 This repository is an implementation of DL models to multi-label classification of LULC classes present in the BigEarthNet Dataset. 
 
 The repo contains the end-to-end AI pipeline for Data Pre Processing; Imbalancing; Dataset Classes; DataLoaders; Training, Validation and Test.
+
+![big-earth](imgs/output.png)
 
 # Quick Start! 
 
